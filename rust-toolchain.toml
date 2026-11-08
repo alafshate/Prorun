@@ -1,0 +1,5 @@
+[toolchain]
+# Tauri's Windows build needs an MSVC host as well as an MSVC target.
+# Selecting only --target leaves build scripts on a GNU host toolchain.
+channel = "stable-x86_64-pc-windows-msvc"
+profile = "minimal"
