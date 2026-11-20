@@ -9,11 +9,13 @@ export default function LogsPane({
   selected,
   onSelect,
   onError,
+  kind = 'service',
 }: {
   services: Service[];
   selected: string;
   onSelect: (id: string) => void;
   onError: (e: unknown) => void;
+  kind?: 'service' | 'action';
 }) {
   const [logs, setLogs] = useState<LogEntry[]>([]),
     [follow, setFollow] = useState(true),
@@ -33,7 +35,7 @@ export default function LogsPane({
       if (!selected) return;
       const readGeneration = generation.current;
       try {
-        const entries = await invoke<LogEntry[]>('service_logs', {
+        const entries = await invoke<LogEntry[]>(kind === 'action' ? 'action_logs' : 'service_logs', {
           id: selected,
           after: cursor.current,
         });
@@ -54,13 +56,15 @@ export default function LogsPane({
       clearTimeout(timer);
       if (generation.current === current) generation.current++;
     };
-  }, [selected]);
+  }, [selected, kind]);
   useEffect(() => {
     if (follow && viewport.current) viewport.current.scrollTop = viewport.current.scrollHeight;
   }, [logs, follow]);
   const clear = async () => {
+    const current = generation.current;
     try {
-      await invoke('clear_logs', { id: selected });
+      await invoke(kind === 'action' ? 'clear_action_logs' : 'clear_logs', { id: selected });
+      if (generation.current !== current) return;
       generation.current++;
       setLogs([]);
     } catch (e) {
@@ -82,7 +86,7 @@ export default function LogsPane({
         <div className="toolbar-start">
           <span className="muted small">OUTPUT</span>
           <select
-            aria-label="Service logs"
+            aria-label={kind === 'action' ? 'Action output' : 'Service logs'}
             value={selected}
             onChange={(e) => onSelect(e.target.value)}
           >
@@ -100,6 +104,7 @@ export default function LogsPane({
           <button
             className={follow ? 'subtle selected' : 'subtle'}
             onClick={() => setFollow(!follow)}
+            aria-pressed={follow}
             title="Automatically follow output"
           >
             <ArrowDownToLine size={14} /> Follow
@@ -139,12 +144,12 @@ export default function LogsPane({
           <div className="output-empty">
             <span className="prompt-symbol">›_</span>
             <p>Your output starts here</p>
-            <span>Run a service to stream its logs in real time.</span>
+            <span>Run {kind === 'action' ? 'an action' : 'a service'} to stream its logs in real time.</span>
           </div>
         )}
       </div>
       <div className="panel-footer">
-        <span>{logs.length} output chunks · 512 KB retained per service</span>
+        <span>{logs.length} output chunks · 512 KB retained per {kind}</span>
         <span>{follow ? 'Following output' : 'Scroll paused'}</span>
       </div>
     </div>

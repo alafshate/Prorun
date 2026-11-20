@@ -11,6 +11,7 @@ import {
   FolderOpen,
   FolderPlus,
   GitBranch,
+  GripVertical,
   LayoutGrid,
   Loader2,
   MoreHorizontal,
@@ -33,16 +34,20 @@ import { folderName } from './utils';
 import Modal from './Modal';
 import LogsPane from './LogsPane';
 import TerminalPane from './TerminalPane';
+import UsageTab from './UsageTab';
+import ActionsPane from './ActionsPane';
 
 type Editor =
-  | { kind: 'service'; projectId: string; service: Service }
+  | { kind: 'service' | 'action'; projectId: string; service: Service }
   | { kind: 'project'; project: Project }
   | { kind: 'settings' }
   | { kind: 'remove-project'; project: Project }
-  | { kind: 'remove-service'; projectId: string; service: Service };
-const initialSnapshot: Snapshot = { services: [], terminals: [], bashPath: null };
+  | { kind: 'remove-service' | 'remove-action'; projectId: string; service: Service };
+const initialSnapshot: Snapshot = { services: [], actions: [], terminals: [], bashPath: null };
 const newId = () => crypto.randomUUID();
 export default function App() {
+  const [view, setView] = useState<'project' | 'usage'>('project');
+  const [usageAlerts, setUsageAlerts] = useState(0);
   const [config, setConfig] = useState<Config | null>(null),
     [snapshot, setSnapshot] = useState<Snapshot>(initialSnapshot),
     [selected, setSelected] = useState(''),
@@ -51,10 +56,13 @@ export default function App() {
     [error, setError] = useState(''),
     [fatal, setFatal] = useState(''),
     [busy, setBusy] = useState<Set<string>>(new Set()),
-    [panel, setPanel] = useState<'logs' | 'terminal'>('logs');
+    [panel, setPanel] = useState<'logs' | 'actions' | 'terminal'>('logs');
   const [logSelections, setLogSelections] = useState<Record<string, string>>({}),
+    [actionSelections, setActionSelections] = useState<Record<string, string>>({}),
     [terminalSelections, setTerminalSelections] = useState<Record<string, string>>({}),
     [now, setNow] = useState(Date.now());
+  const [draggingProject, setDraggingProject] = useState<string | null>(null);
+  const [projectDropTarget, setProjectDropTarget] = useState<string | null>(null);
   const configRef = useRef(config),
     busyRef = useRef(new Set<string>());
   configRef.current = config;
@@ -112,6 +120,8 @@ export default function App() {
     setConfig(value);
   };
   const project = config?.projects.find((p) => p.id === selected);
+  const visibleProjects =
+    config?.projects.filter((p) => p.name.toLowerCase().includes(search.toLowerCase())) || [];
   const runtimes = new Map(snapshot.services.map((r) => [r.id, r]));
   const running = snapshot.services.filter((s) => s.status === 'running').length;
   const projectRunning =
@@ -123,6 +133,9 @@ export default function App() {
     project?.services.find((s) => s.id === logSelections[selected])?.id ||
     project?.services[0]?.id ||
     '';
+  const selectedAction =
+    project?.actions.find((a) => a.id === actionSelections[selected])?.id ||
+    project?.actions[0]?.id || '';
   const addProject = () =>
     void perform('config', async () => {
       const root = await open({ directory: true, multiple: false, title: 'Choose a project root' });
@@ -133,6 +146,7 @@ export default function App() {
       );
       if (existing) {
         setSelected(existing.id);
+        setView('project');
         return;
       }
       const added: Project = {
@@ -140,11 +154,32 @@ export default function App() {
         name: folderName(canonical),
         root: canonical,
         services: [],
+        actions: [],
       };
       await save({ ...configRef.current!, projects: [...configRef.current!.projects, added] });
       setSelected(added.id);
+      setView('project');
       setPanel('logs');
     });
+  const moveProject = (
+    id: string,
+    targetId: string | undefined,
+    focusButton?: HTMLButtonElement,
+  ) => {
+    if (!targetId || id === targetId) return;
+    void perform('config', async () => {
+      const current = configRef.current;
+      if (!current) return;
+      const from = current.projects.findIndex((p) => p.id === id);
+      const to = current.projects.findIndex((p) => p.id === targetId);
+      if (from < 0 || to < 0) return;
+      const projects = [...current.projects];
+      const [moved] = projects.splice(from, 1);
+      projects.splice(to, 0, moved);
+      await save({ ...current, projects });
+      if (focusButton) requestAnimationFrame(() => focusButton.focus());
+    });
+  };
   const action = (service: Service, action: string) =>
     void perform(service.id, async () => {
       await invoke('service_action', { id: service.id, action });
@@ -155,6 +190,26 @@ export default function App() {
     void perform(project.id, async () => {
       await invoke('project_action', { id: project.id, action });
       await refresh();
+    });
+  const executeAction = (saved: Service, operation: 'start' | 'stop') =>
+    void perform(saved.id, async () => {
+      setActionSelections((old) => ({ ...old, [selected]: saved.id }));
+      try {
+        await invoke('action_execute', { id: saved.id, action: operation });
+      } finally {
+        await refresh();
+      }
+    });
+  const duplicateAction = (saved: Service) =>
+    project &&
+    void perform('config', async () => {
+      const copy = { ...saved, id: newId(), name: `${saved.name} copy` };
+      await save({
+        ...configRef.current!,
+        projects: configRef.current!.projects.map((p) =>
+          p.id === project.id ? { ...p, actions: [...p.actions, copy] } : p),
+      });
+      setActionSelections((old) => ({ ...old, [project.id]: copy.id }));
     });
   const createTerminal = () =>
     project &&
@@ -191,7 +246,8 @@ export default function App() {
           ),
         });
       }
-      if (editor?.kind === 'service') {
+      if (editor?.kind === 'service' || editor?.kind === 'action') {
+        const collection = editor.kind === 'action' ? 'actions' : 'services';
         const updated: Service = {
           id: editor.service.id,
           name: String(data.get('name')).trim(),
@@ -204,17 +260,21 @@ export default function App() {
             p.id === editor.projectId
               ? {
                   ...p,
-                  services: p.services.some((s) => s.id === updated.id)
-                    ? p.services.map((s) => (s.id === updated.id ? updated : s))
-                    : [...p.services, updated],
+                  [collection]: p[collection].some((s) => s.id === updated.id)
+                    ? p[collection].map((s) => (s.id === updated.id ? updated : s))
+                    : [...p[collection], updated],
                 }
               : p,
           ),
         });
-        setLogSelections((old) => ({ ...old, [editor.projectId]: updated.id }));
+        (editor.kind === 'action' ? setActionSelections : setLogSelections)((old) => ({
+          ...old, [editor.projectId]: updated.id,
+        }));
       }
       if (editor?.kind === 'remove-project') {
         await invoke('project_action', { id: editor.project.id, action: 'stop' });
+        for (const a of editor.project.actions)
+          await invoke('action_execute', { id: a.id, action: 'stop' });
         const sessions = snapshot.terminals.filter((t) => t.projectId === editor.project.id);
         for (const t of sessions) await invoke('terminal_close', { id: t.id });
         const projects = current.projects.filter((p) => p.id !== editor.project.id);
@@ -222,13 +282,16 @@ export default function App() {
         setSelected(projects[0]?.id || '');
         await refresh();
       }
-      if (editor?.kind === 'remove-service') {
-        await invoke('service_action', { id: editor.service.id, action: 'stop' });
+      if (editor?.kind === 'remove-service' || editor?.kind === 'remove-action') {
+        const collection = editor.kind === 'remove-action' ? 'actions' : 'services';
+        await invoke(editor.kind === 'remove-action' ? 'action_execute' : 'service_action', {
+          id: editor.service.id, action: 'stop',
+        });
         await save({
           ...current,
           projects: current.projects.map((p) =>
             p.id === editor.projectId
-              ? { ...p, services: p.services.filter((s) => s.id !== editor.service.id) }
+              ? { ...p, [collection]: p[collection].filter((s) => s.id !== editor.service.id) }
               : p,
           ),
         });
@@ -284,6 +347,14 @@ export default function App() {
           </div>
           <span className="local-dot" />
         </div>
+        <button
+          className={`usage-nav ${view === 'usage' ? 'active' : ''}`}
+          aria-current={view === 'usage' ? 'page' : undefined}
+          onClick={() => setView('usage')}
+        >
+          <Activity size={17} /> AI Usage
+          {usageAlerts > 0 && <b aria-label={`${usageAlerts} usage alerts`}>{usageAlerts}</b>}
+        </button>
         <div className="sidebar-heading">
           <span>
             PROJECTS <b>{config.projects.length}</b>
@@ -307,30 +378,75 @@ export default function App() {
           />
         </div>
         <nav className="project-list" aria-label="Projects">
-          {config.projects
-            .filter((p) => p.name.toLowerCase().includes(search.toLowerCase()))
-            .map((p, index) => {
-              const count = p.services.filter(
-                (s) => runtimes.get(s.id)?.status === 'running',
-              ).length;
-              return (
-                <button
-                  key={p.id}
-                  className={`project-link ${p.id === selected ? 'active' : ''}`}
-                  onClick={() => {
-                    setSelected(p.id);
-                    setError('');
-                  }}
-                >
-                  <span className={`project-avatar color-${index % 4}`}>
-                    {p.name.slice(0, 2).toUpperCase()}
-                  </span>
-                  <span className="project-link-text">
-                    <strong>{p.name}</strong>
-                    <small>
-                      {p.services.length} service{p.services.length === 1 ? '' : 's'}
-                    </small>
-                  </span>
+          {visibleProjects.map((p, index) => {
+            const count = p.services.filter((s) => runtimes.get(s.id)?.status === 'running').length;
+            return (
+              <button
+                key={p.id}
+                className={`project-link ${p.id === selected && view === 'project' ? 'active' : ''} ${p.id === draggingProject ? 'is-dragging' : ''} ${p.id === projectDropTarget && draggingProject && draggingProject !== p.id ? (visibleProjects.findIndex((item) => item.id === draggingProject) < index ? 'drop-after' : 'drop-before') : ''}`}
+                draggable={visibleProjects.length > 1 && !busy.has('config')}
+                title={
+                  visibleProjects.length > 1
+                    ? 'Drag to reorder · Alt+Up/Down to move · Alt+Home/End for top/bottom'
+                    : undefined
+                }
+                aria-description="Drag to reorder. Alt+Up/Down moves one place; Alt+Home/End moves to the top or bottom."
+                aria-keyshortcuts="Alt+ArrowUp Alt+ArrowDown Alt+Home Alt+End"
+                onDragStart={(event) => {
+                  if (busyRef.current.has('config')) {
+                    event.preventDefault();
+                    return;
+                  }
+                  event.dataTransfer.effectAllowed = 'move';
+                  event.dataTransfer.setData('application/x-prorun-project', p.id);
+                  setDraggingProject(p.id);
+                }}
+                onDragOver={(event) => {
+                  if (!draggingProject || draggingProject === p.id || busyRef.current.has('config'))
+                    return;
+                  event.preventDefault();
+                  event.dataTransfer.dropEffect = 'move';
+                  setProjectDropTarget(p.id);
+                }}
+                onDrop={(event) => {
+                  if (!draggingProject || busyRef.current.has('config')) return;
+                  event.preventDefault();
+                  moveProject(draggingProject, p.id);
+                  setDraggingProject(null);
+                  setProjectDropTarget(null);
+                }}
+                onDragEnd={() => {
+                  setDraggingProject(null);
+                  setProjectDropTarget(null);
+                }}
+                onKeyDown={(event) => {
+                  if (!event.altKey || !['ArrowUp', 'ArrowDown', 'Home', 'End'].includes(event.key))
+                    return;
+                  event.preventDefault();
+                  const target =
+                    event.key === 'Home'
+                      ? 0
+                      : event.key === 'End'
+                        ? visibleProjects.length - 1
+                        : index + (event.key === 'ArrowUp' ? -1 : 1);
+                  moveProject(p.id, visibleProjects[target]?.id, event.currentTarget);
+                }}
+                onClick={() => {
+                  setSelected(p.id);
+                  setView('project');
+                  setError('');
+                }}
+              >
+                <span className={`project-avatar color-${index % 4}`}>
+                  {p.name.slice(0, 2).toUpperCase()}
+                </span>
+                <span className="project-link-text">
+                  <strong>{p.name}</strong>
+                  <small>
+                    {p.services.length} service{p.services.length === 1 ? '' : 's'}
+                  </small>
+                </span>
+                <span className="project-trailing">
                   {count > 0 ? (
                     <span className="project-running">
                       {count}
@@ -339,9 +455,13 @@ export default function App() {
                   ) : (
                     <span className="inactive-dot" />
                   )}
-                </button>
-              );
-            })}
+                  {config.projects.length > 1 && (
+                    <GripVertical size={14} className="project-drag-handle" aria-hidden="true" />
+                  )}
+                </span>
+              </button>
+            );
+          })}
           {search &&
             !config.projects.some((p) => p.name.toLowerCase().includes(search.toLowerCase())) && (
               <p className="no-results">No matching projects</p>
@@ -380,12 +500,22 @@ export default function App() {
             <LayoutGrid size={15} />
             <span>Workspace</span>
             <ChevronRight size={13} />
-            <strong>{project?.name || 'Overview'}</strong>
+            <strong>{view === 'usage' ? 'AI Usage' : project?.name || 'Overview'}</strong>
           </div>
           <span className="environment-badge">
             <span /> Local environment
           </span>
         </header>
+        {view === 'project' && usageAlerts > 0 && (
+          <div className="usage-alert usage-global-alert" role="status">
+            <Activity size={16} />
+            <span>
+              {usageAlerts} AI usage alert{usageAlerts === 1 ? '' : 's'} · A provider reached a
+              configured capacity threshold.
+            </span>
+            <button onClick={() => setView('usage')}>View usage</button>
+          </div>
+        )}
         {error && !editor && (
           <div className="error-banner" role="alert">
             <span>{error}</span>
@@ -394,8 +524,9 @@ export default function App() {
             </button>
           </div>
         )}
+        <UsageTab active={view === 'usage'} onAlertCount={setUsageAlerts} />
         {!project ? (
-          <div className="welcome">
+          <div className="welcome" hidden={view === 'usage'}>
             <div className="welcome-art">
               <FolderOpen size={48} />
               <span>
@@ -424,7 +555,7 @@ export default function App() {
             </div>
           </div>
         ) : (
-          <div className="project-content">
+          <div className="project-content" hidden={view === 'usage'}>
             <section className="project-header">
               <div className="project-title">
                 <span className="eyebrow">PROJECT WORKSPACE</span>
@@ -575,7 +706,7 @@ export default function App() {
                 )}
               </div>
             </section>
-            <section className="output-panel">
+            <section className={`output-panel ${panel === 'actions' ? 'actions-panel' : ''}`}>
               <div className="panel-tabs">
                 <div role="tablist" aria-label="Project output">
                   <button
@@ -585,6 +716,15 @@ export default function App() {
                     onClick={() => setPanel('logs')}
                   >
                     <Activity size={15} /> Service logs
+                  </button>
+                  <button
+                    role="tab"
+                    aria-selected={panel === 'actions'}
+                    className={panel === 'actions' ? 'active' : ''}
+                    onClick={() => setPanel('actions')}
+                  >
+                    <Play size={15} /> Actions{' '}
+                    {project.actions.length > 0 && <span>{project.actions.length}</span>}
                   </button>
                   <button
                     role="tab"
@@ -606,6 +746,29 @@ export default function App() {
                   services={project.services}
                   selected={selectedLog}
                   onSelect={(id) => setLogSelections((old) => ({ ...old, [project.id]: id }))}
+                  onError={showError}
+                />
+              )}
+              {panel === 'actions' && (
+                <ActionsPane
+                  key={project.id}
+                  actions={project.actions}
+                  runtimes={snapshot.actions}
+                  selected={selectedAction}
+                  now={now}
+                  busy={busy}
+                  configBusy={busy.has('config')}
+                  bashAvailable={!!snapshot.bashPath}
+                  onSelect={(id) => setActionSelections((old) => ({ ...old, [project.id]: id }))}
+                  onRun={(a) => executeAction(a, 'start')}
+                  onStop={(a) => executeAction(a, 'stop')}
+                  onAdd={() => setEditor({
+                    kind: 'action', projectId: project.id,
+                    service: { id: newId(), name: '', directory: '.', command: '' },
+                  })}
+                  onEdit={(a) => setEditor({ kind: 'action', projectId: project.id, service: a })}
+                  onDuplicate={duplicateAction}
+                  onDelete={(a) => setEditor({ kind: 'remove-action', projectId: project.id, service: a })}
                   onError={showError}
                 />
               )}
@@ -647,7 +810,7 @@ export default function App() {
                   <TerminalPane
                     id={t.id}
                     key={t.id}
-                    active={panel === 'terminal' && activeTerminal === t.id}
+                    active={view === 'project' && panel === 'terminal' && activeTerminal === t.id}
                   />
                 ))}
                 {!activeTerminal && (
@@ -685,17 +848,17 @@ export default function App() {
               ? 'Workspace settings'
               : editor.kind === 'project'
                 ? 'Edit project'
-                : editor.kind === 'service'
-                  ? project?.services.some((s) => s.id === editor.service.id)
-                    ? 'Edit service'
-                    : 'Add a service'
+                : editor.kind === 'service' || editor.kind === 'action'
+                  ? project?.[editor.kind === 'action' ? 'actions' : 'services'].some((s) => s.id === editor.service.id)
+                    ? `Edit ${editor.kind}`
+                    : editor.kind === 'action' ? 'Add an action' : 'Add a service'
                   : editor.kind === 'remove-project'
                     ? 'Remove project?'
-                    : 'Remove service?'
+                    : editor.kind === 'remove-action' ? 'Delete action?' : 'Remove service?'
           }
           subtitle={
-            editor.kind === 'service'
-              ? 'Give your process a name and a Git Bash startup command.'
+            editor.kind === 'service' || editor.kind === 'action'
+              ? editor.kind === 'action' ? 'Save a Git Bash command to run on demand.' : 'Give your process a name and a Git Bash startup command.'
               : editor.kind === 'settings'
                 ? 'Your shell, on your machine.'
                 : 'Manage your local workspace.'
@@ -722,7 +885,7 @@ export default function App() {
                     </strong>
                     <span>
                       {snapshot.bashPath ||
-                        'Install Git for Windows to run services and terminals.'}
+                        'Install Git for Windows to run services, actions, and terminals.'}
                     </span>
                   </div>
                   <span className={snapshot.bashPath ? 'signal running' : 'signal'} />
@@ -765,7 +928,7 @@ export default function App() {
                   <strong>Everything stays local</strong>
                   <p>
                     Project settings are saved in your Windows app data folder. Logs and terminal
-                    output stay in memory and are bounded. Closing ProRun stops its services and
+                    output stay in memory and are bounded. Closing ProRun stops its services, actions, and
                     terminals.
                   </p>
                   <p>
@@ -804,7 +967,7 @@ export default function App() {
                   </div>
                 </label>
                 <p className="field-help">
-                  Stop the project's services and close its terminals before changing its root.
+                  Stop the project's services and actions and close its terminals before changing its root.
                 </p>
                 <button
                   type="button"
@@ -815,20 +978,20 @@ export default function App() {
                 </button>
               </>
             )}
-            {editor.kind === 'service' && (
+            {(editor.kind === 'service' || editor.kind === 'action') && (
               <>
                 <label>
-                  Service name
+                  {editor.kind === 'action' ? 'Action name' : 'Service name'}
                   <input
                     autoComplete="off"
                     name="name"
                     required
                     maxLength={80}
-                    placeholder="e.g. Frontend"
+                    placeholder={editor.kind === 'action' ? 'e.g. Run tests' : 'e.g. Frontend'}
                     defaultValue={editor.service.name}
                   />
                 </label>
-                <div className="name-presets">
+                {editor.kind === 'service' && <div className="name-presets">
                   {['Frontend', 'Backend', 'Worker', 'Database'].map((name) => (
                     <button
                       key={name}
@@ -844,7 +1007,7 @@ export default function App() {
                       {name}
                     </button>
                   ))}
-                </div>
+                </div>}
                 <label>
                   Working directory
                   <div className="path-input">
@@ -856,7 +1019,7 @@ export default function App() {
                     <button
                       type="button"
                       className="icon-button"
-                      aria-label="Choose service directory"
+                      aria-label={`Choose ${editor.kind} directory`}
                       onClick={async (e) => {
                         const input = e.currentTarget.parentElement!.querySelector('input')!;
                         try {
@@ -879,14 +1042,14 @@ export default function App() {
                   Relative to the project root, or an absolute Windows path. Use . for the root.
                 </p>
                 <label>
-                  Startup command
+                  {editor.kind === 'action' ? 'Command' : 'Startup command'}
                   <textarea
                     name="command"
                     required
                     spellCheck={false}
                     maxLength={24000}
                     rows={3}
-                    placeholder="npm run dev"
+                    placeholder={editor.kind === 'action' ? 'npm test' : 'npm run dev'}
                     defaultValue={editor.service.command}
                   />
                 </label>
@@ -894,14 +1057,14 @@ export default function App() {
                   <GitBranch size={12} /> Executed directly in Git Bash. Pipes, environment
                   variables, and shell scripts are supported.
                 </p>
-                {runtimes.get(editor.service.id)?.status === 'running' && (
-                  <div className="form-notice">Stop this service before saving changes.</div>
+                {(editor.kind === 'action' ? snapshot.actions.find((a) => a.id === editor.service.id) : runtimes.get(editor.service.id))?.status === 'running' && (
+                  <div className="form-notice">Stop this {editor.kind} before saving changes.</div>
                 )}
               </>
             )}
             {editor.kind === 'remove-project' && (
               <p className="confirmation">
-                Remove <strong>{editor.project.name}</strong> from ProRun? Its services and terminal
+                Remove <strong>{editor.project.name}</strong> from ProRun? Its services, actions, and terminal
                 sessions will be stopped. Your project files will stay on disk.
               </p>
             )}
@@ -909,6 +1072,11 @@ export default function App() {
               <p className="confirmation">
                 Remove <strong>{editor.service.name}</strong>? The service will be stopped and its
                 configuration removed. Your files will stay on disk.
+              </p>
+            )}
+            {editor.kind === 'remove-action' && (
+              <p className="confirmation">
+                Delete <strong>{editor.service.name}</strong>? Any running execution and its child processes will be stopped, and the saved action and output removed.
               </p>
             )}
             <div className="modal-actions">
@@ -929,9 +1097,9 @@ export default function App() {
               >
                 {busy.has('config') && <Loader2 size={14} className="spin" />}
                 {editor.kind.startsWith('remove')
-                  ? 'Remove'
-                  : editor.kind === 'service'
-                    ? 'Save service'
+                  ? editor.kind === 'remove-action' ? 'Delete' : 'Remove'
+                  : editor.kind === 'service' || editor.kind === 'action'
+                    ? `Save ${editor.kind}`
                     : 'Save changes'}
               </button>
             </div>

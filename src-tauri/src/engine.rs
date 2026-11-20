@@ -20,6 +20,7 @@ pub struct Status {
     pub id: String,
     pub status: String,
     pub started_at: Option<u64>,
+    pub ended_at: Option<u64>,
     pub exit_code: Option<i32>,
     pub error: Option<String>,
 }
@@ -46,6 +47,7 @@ impl Run {
                 id,
                 status: "stopped".into(),
                 started_at: None,
+                ended_at: None,
                 exit_code: None,
                 error: None,
             },
@@ -92,7 +94,9 @@ pub struct Terminal {
 pub struct Inner {
     pub config: Config,
     pub runs: HashMap<String, Shared<Run>>,
+    pub actions: HashMap<String, Shared<Run>>,
     pub terminals: HashMap<String, Arc<Terminal>>,
+    shutting_down: bool,
 }
 #[derive(Clone)]
 pub struct Engine {
@@ -115,7 +119,9 @@ impl Engine {
             inner: Arc::new(Mutex::new(Inner {
                 config,
                 runs: HashMap::new(),
+                actions: HashMap::new(),
                 terminals: HashMap::new(),
+                shutting_down: false,
             })),
             config_path,
         })
@@ -151,6 +157,26 @@ impl Engine {
                     ));
                 }
             }
+            for action in &old.actions {
+                let changed = next
+                    .map(|p| {
+                        p.root != old.root
+                            || p.actions.iter().find(|a| a.id == action.id) != Some(action)
+                    })
+                    .unwrap_or(true);
+                if changed
+                    && inner
+                        .actions
+                        .get(&action.id)
+                        .map(|r| r.lock().unwrap().status.status == "running")
+                        .unwrap_or(false)
+                {
+                    return Err(format!(
+                        "Stop {} before editing or removing its configuration",
+                        action.name
+                    ));
+                }
+            }
             if next.map(|p| p.root != old.root).unwrap_or(true)
                 && inner.terminals.values().any(|t| t.project_id == old.id)
             {
@@ -172,16 +198,34 @@ impl Engine {
             .flat_map(|p| p.services.iter().map(|s| s.id.clone()))
             .collect();
         inner.runs.retain(|id, _| ids.contains(id));
+        let action_ids: Vec<_> = config
+            .projects
+            .iter()
+            .flat_map(|p| p.actions.iter().map(|a| a.id.clone()))
+            .collect();
+        inner.actions.retain(|id, _| action_ids.contains(id));
         inner.config = config;
         Ok(())
     }
     pub fn start(&self, id: &str) -> Result<(), String> {
+        self.start_command(id, false)
+    }
+    pub fn start_action(&self, id: &str) -> Result<(), String> {
+        self.start_command(id, true)
+    }
+    fn start_command(&self, id: &str, is_action: bool) -> Result<(), String> {
         let mut inner = self.inner.lock().unwrap();
-        if inner
-            .runs
-            .get(id)
-            .map(|r| r.lock().unwrap().status.status == "running")
-            .unwrap_or(false)
+        if inner.shutting_down {
+            return Err("ProRun is shutting down".into());
+        }
+        if (if is_action {
+            &inner.actions
+        } else {
+            &inner.runs
+        })
+        .get(id)
+        .map(|r| r.lock().unwrap().status.status == "running")
+        .unwrap_or(false)
         {
             return Ok(());
         }
@@ -190,17 +234,24 @@ impl Engine {
             .projects
             .iter()
             .find_map(|p| {
-                p.services
+                (if is_action { &p.actions } else { &p.services })
                     .iter()
                     .find(|s| s.id == id)
                     .map(|s| (p.clone(), s.clone()))
             })
-            .ok_or("Service no longer exists")?;
-        let run = inner
-            .runs
-            .entry(id.into())
-            .or_insert_with(|| Arc::new(Mutex::new(Run::new(id.into()))))
-            .clone();
+            .ok_or(if is_action {
+                "Action no longer exists"
+            } else {
+                "Service no longer exists"
+            })?;
+        let run = (if is_action {
+            &mut inner.actions
+        } else {
+            &mut inner.runs
+        })
+        .entry(id.into())
+        .or_insert_with(|| Arc::new(Mutex::new(Run::new(id.into()))))
+        .clone();
         let generation = {
             let mut r = run.lock().unwrap();
             r.generation += 1;
@@ -208,6 +259,7 @@ impl Engine {
             r.status.error = None;
             r.status.exit_code = None;
             r.status.started_at = None;
+            r.status.ended_at = None;
             r.generation
         };
         let result = (|| {
@@ -225,6 +277,7 @@ impl Engine {
                 let mut r = run.lock().unwrap();
                 r.status.status = "failed".into();
                 r.status.error = Some(e.clone());
+                r.status.ended_at = Some(now());
                 r.log("system", format!("Startup failed: {e}\n"));
                 return Err(e);
             }
@@ -236,18 +289,30 @@ impl Engine {
             r.process = Some(process.clone());
             r.log("system", format!("$ {}\n", service.command));
         }
-        read_logs(out, run.clone(), "stdout");
-        read_logs(err, run.clone(), "stderr");
+        let stdout = read_logs(out, run.clone(), "stdout", generation);
+        let stderr = read_logs(err, run.clone(), "stderr", generation);
         thread::spawn(move || {
             let code = process.wait();
             // A launcher that exits must not leave its server descendants orphaned.
             process.job.terminate();
+            // Drain both pipes before exposing completion or allowing another run.
+            let _ = stdout.join();
+            let _ = stderr.join();
             let mut r = run.lock().unwrap();
             if r.generation != generation {
                 return;
             }
             r.status.exit_code = Some(code);
-            r.status.status = if r.stopping || code == 0 {
+            r.status.ended_at = Some(now());
+            r.status.status = if is_action {
+                if r.stopping {
+                    "idle"
+                } else if code == 0 {
+                    "success"
+                } else {
+                    "failed"
+                }
+            } else if r.stopping || code == 0 {
                 "stopped"
             } else {
                 "failed"
@@ -259,8 +324,20 @@ impl Engine {
         Ok(())
     }
     pub fn stop(&self, id: &str) -> Result<(), String> {
+        self.stop_command(id, false)
+    }
+    pub fn stop_action(&self, id: &str) -> Result<(), String> {
+        self.stop_command(id, true)
+    }
+    fn stop_command(&self, id: &str, is_action: bool) -> Result<(), String> {
         let inner = self.inner.lock().unwrap();
-        let run = inner.runs.get(id).cloned();
+        let run = (if is_action {
+            &inner.actions
+        } else {
+            &inner.runs
+        })
+        .get(id)
+        .cloned();
         if let Some(run) = run {
             let process = {
                 let mut r = run.lock().unwrap();
@@ -269,10 +346,16 @@ impl Engine {
             };
             if let Some(p) = process {
                 p.stop();
+                let code = p
+                    .exit_code()
+                    .ok_or("Process has not stopped yet; try Stop again")?;
                 let mut r = run.lock().unwrap();
-                r.status.status = "stopped".into();
-                r.status.exit_code = Some(1);
+                r.generation += 1;
+                r.status.status = if is_action { "idle" } else { "stopped" }.into();
+                r.status.exit_code = Some(code);
+                r.status.ended_at = Some(now());
                 r.process = None;
+                r.log("system", "Stopped by user\n".into());
             }
         }
         Ok(())
@@ -313,6 +396,9 @@ impl Engine {
         rows: u16,
     ) -> Result<String, String> {
         let mut inner = self.inner.lock().unwrap();
+        if inner.shutting_down {
+            return Err("ProRun is shutting down".into());
+        }
         let project = inner
             .config
             .projects
@@ -501,10 +587,12 @@ impl Engine {
         }
     }
     pub fn shutdown(&self) {
-        let (runs, terminals) = {
-            let inner = self.inner.lock().unwrap();
+        let (runs, actions, terminals) = {
+            let mut inner = self.inner.lock().unwrap();
+            inner.shutting_down = true;
             (
                 inner.runs.keys().cloned().collect::<Vec<_>>(),
+                inner.actions.keys().cloned().collect::<Vec<_>>(),
                 inner.terminals.keys().cloned().collect::<Vec<_>>(),
             )
         };
@@ -514,27 +602,51 @@ impl Engine {
         for id in runs {
             let _ = self.stop(&id);
         }
+        for id in actions {
+            let _ = self.stop_action(&id);
+        }
     }
     pub fn logs(&self, id: &str, after: u64) -> Vec<Log> {
-        self.inner
-            .lock()
-            .unwrap()
-            .runs
-            .get(id)
-            .map(|r| {
-                r.lock()
-                    .unwrap()
-                    .logs
-                    .iter()
-                    .filter(|l| l.seq > after)
-                    .take(256)
-                    .cloned()
-                    .collect()
-            })
-            .unwrap_or_default()
+        self.command_logs(id, after, false)
+    }
+    pub fn action_logs(&self, id: &str, after: u64) -> Vec<Log> {
+        self.command_logs(id, after, true)
+    }
+    fn command_logs(&self, id: &str, after: u64, is_action: bool) -> Vec<Log> {
+        let inner = self.inner.lock().unwrap();
+        (if is_action {
+            &inner.actions
+        } else {
+            &inner.runs
+        })
+        .get(id)
+        .map(|r| {
+            r.lock()
+                .unwrap()
+                .logs
+                .iter()
+                .filter(|l| l.seq > after)
+                .take(256)
+                .cloned()
+                .collect()
+        })
+        .unwrap_or_default()
     }
     pub fn clear_logs(&self, id: &str) {
-        if let Some(r) = self.inner.lock().unwrap().runs.get(id) {
+        self.clear_command_logs(id, false);
+    }
+    pub fn clear_action_logs(&self, id: &str) {
+        self.clear_command_logs(id, true);
+    }
+    fn clear_command_logs(&self, id: &str, is_action: bool) {
+        let inner = self.inner.lock().unwrap();
+        if let Some(r) = (if is_action {
+            &inner.actions
+        } else {
+            &inner.runs
+        })
+        .get(id)
+        {
             let mut r = r.lock().unwrap();
             r.logs.clear();
             r.bytes = 0;
@@ -553,7 +665,12 @@ pub fn size(cols: u16, rows: u16) -> Result<PtySize, String> {
     })
 }
 
-fn read_logs(mut reader: File, run: Shared<Run>, stream: &'static str) {
+fn read_logs(
+    mut reader: File,
+    run: Shared<Run>,
+    stream: &'static str,
+    generation: u64,
+) -> thread::JoinHandle<()> {
     thread::spawn(move || {
         let mut buffer = [0u8; 4096];
         let mut pending = Vec::new();
@@ -561,9 +678,10 @@ fn read_logs(mut reader: File, run: Shared<Run>, stream: &'static str) {
             match reader.read(&mut buffer) {
                 Ok(0) | Err(_) => {
                     if !pending.is_empty() {
-                        run.lock()
-                            .unwrap()
-                            .log(stream, String::from_utf8_lossy(&pending).into_owned());
+                        let mut r = run.lock().unwrap();
+                        if r.generation == generation {
+                            r.log(stream, String::from_utf8_lossy(&pending).into_owned());
+                        }
                     }
                     break;
                 }
@@ -575,21 +693,37 @@ fn read_logs(mut reader: File, run: Shared<Run>, stream: &'static str) {
                         Err(_) => pending.len(),
                     };
                     if consumed > 0 {
-                        run.lock().unwrap().log(
-                            stream,
-                            String::from_utf8_lossy(&pending[..consumed]).into_owned(),
-                        );
+                        let mut r = run.lock().unwrap();
+                        if r.generation == generation {
+                            r.log(
+                                stream,
+                                String::from_utf8_lossy(&pending[..consumed]).into_owned(),
+                            );
+                        }
                         pending.drain(..consumed);
                     }
                 }
             }
         }
-    });
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    fn remove_workspace(root: PathBuf) {
+        // ConPTY may release its cwd shortly after the job reports zero processes.
+        for _ in 0..100 {
+            match fs::remove_dir_all(&root) {
+                Ok(()) => return,
+                Err(e) if e.raw_os_error() == Some(32) => {
+                    thread::sleep(std::time::Duration::from_millis(20))
+                }
+                Err(e) => panic!("Cannot remove test workspace: {e}"),
+            }
+        }
+        fs::remove_dir_all(root).unwrap();
+    }
     #[test]
     fn log_memory_is_bounded() {
         let mut r = Run::new("test".into());
@@ -618,6 +752,7 @@ mod tests {
                 name: "Test".into(),
                 root: root.to_string_lossy().into(),
                 services: vec![service],
+                actions: vec![],
             }],
         };
         engine.save(config).unwrap();
@@ -678,7 +813,7 @@ mod tests {
             1
         );
         engine.shutdown();
-        fs::remove_dir_all(root).unwrap();
+        remove_workspace(root);
     }
     #[test]
     fn interactive_git_bash_pty() {
@@ -694,6 +829,7 @@ mod tests {
                     name: "PTY".into(),
                     root: root.to_string_lossy().into(),
                     services: vec![],
+                    actions: vec![],
                 }],
             })
             .unwrap();
@@ -767,7 +903,7 @@ mod tests {
                 .alive
         );
         engine.shutdown();
-        fs::remove_dir_all(root).unwrap();
+        remove_workspace(root);
     }
     #[test]
     fn conpty_startup_and_close_without_frontend() {
@@ -784,6 +920,7 @@ mod tests {
                     name: "Startup".into(),
                     root: root.to_string_lossy().into(),
                     services: vec![],
+                    actions: vec![],
                 }],
             })
             .unwrap();
@@ -814,6 +951,6 @@ mod tests {
         }
         assert_eq!(job.active_processes(), 0);
         engine.shutdown();
-        fs::remove_dir_all(root).unwrap();
+        remove_workspace(root);
     }
 }

@@ -291,6 +291,39 @@ button.icon-button:hover {
   background: var(--green);
   border-radius: 2px;
 }
+.project-link[draggable='true'] {
+  cursor: grab;
+}
+.project-link.is-dragging {
+  opacity: 0.45;
+}
+.project-link.drop-before {
+  box-shadow: inset 0 2px 0 var(--green);
+}
+.project-link.drop-after {
+  box-shadow: inset 0 -2px 0 var(--green);
+}
+.project-trailing {
+  position: relative;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
+  min-width: 16px;
+}
+.project-drag-handle {
+  position: absolute;
+  color: #8f9caa;
+  opacity: 0;
+}
+.project-link[draggable='true']:is(:hover, :focus-visible) .project-drag-handle {
+  opacity: 1;
+}
+.project-link[draggable='true']:is(:hover, :focus-visible)
+  .project-trailing
+  > :not(.project-drag-handle) {
+  opacity: 0;
+}
 .project-avatar {
   width: 31px;
   height: 33px;
@@ -1594,6 +1627,89 @@ button.icon-button:hover {
 }
 [hidden] {
   display: none !important;
+}
+.actions-pane {
+  display: flex;
+  flex-direction: column;
+  flex: 1;
+  min-height: 0;
+}
+.actions-panel {
+  flex-basis: auto;
+  flex-shrink: 0;
+}
+.action-list {
+  max-height: 330px;
+  overflow-y: auto;
+  flex-shrink: 0;
+}
+.action-row {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 10px 15px;
+  border-bottom: 1px solid #262c35;
+}
+.action-row.active {
+  background: #a5ed9a07;
+  box-shadow: inset 2px 0 #a5ed9a;
+}
+.action-details {
+  display: flex;
+  flex-direction: column;
+  align-items: stretch;
+  gap: 6px;
+  flex: 1;
+  min-width: 0;
+  background: transparent;
+  border: 0;
+  padding: 3px;
+  text-align: left;
+}
+.action-details strong {
+  font-size: 12px;
+  color: #d4dce7;
+  overflow-wrap: anywhere;
+}
+.action-details code {
+  font-size: 10px;
+  color: #8e9aab;
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+}
+.action-metadata, .action-metadata > span, .action-controls {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+.action-metadata {
+  flex-wrap: wrap;
+  gap: 12px;
+  font-size: 10px;
+  color: #8e9aab;
+}
+.action-metadata > span {
+  overflow-wrap: anywhere;
+  min-width: 0;
+}
+.action-controls {
+  flex-shrink: 0;
+}
+.action-controls > button {
+  padding: 6px 8px;
+  font-size: 10px;
+}
+.service-status.success, .service-status.success i {
+  color: #a5ed9a;
+}
+.service-status.success i {
+  background: #a5ed9a;
+}
+.action-error {
+  font-size: 10px;
+  color: #eda7a9;
+  overflow-wrap: anywhere;
 }
 @media (prefers-reduced-motion: reduce) {
   * {

@@ -2637,6 +2637,7 @@ dependencies = [
 name = "prorun"
 version = "1.0.0"
 dependencies = [
+ "chrono",
  "portable-pty",
  "serde",
  "serde_json",

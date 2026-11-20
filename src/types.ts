@@ -4,11 +4,13 @@ export interface Service {
   directory: string;
   command: string;
 }
+export type Action = Service;
 export interface Project {
   id: string;
   name: string;
   root: string;
   services: Service[];
+  actions: Action[];
 }
 export interface Config {
   version: number;
@@ -19,11 +21,16 @@ export interface Runtime {
   id: string;
   status: 'running' | 'stopped' | 'failed';
   startedAt: number | null;
+  endedAt: number | null;
   exitCode: number | null;
   error: string | null;
 }
+export interface ActionRuntime extends Omit<Runtime, 'status'> {
+  status: 'idle' | 'running' | 'success' | 'failed';
+}
 export interface Snapshot {
   services: Runtime[];
+  actions: ActionRuntime[];
   terminals: { id: string; projectId: string; alive: boolean }[];
   bashPath: string | null;
 }

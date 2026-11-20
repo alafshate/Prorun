@@ -1,5 +1,15 @@
 # Validation record
 
+## Actions feature — November 20, 2026
+
+- Added project-specific action persistence with backwards-compatible defaults, a dedicated Actions tab, shared service/action command editing, duplication/deletion, and the existing live output viewer. Services and actions retain separate runtime maps, logs, IPC commands, and lifecycle controls.
+- Added native coverage for persistence after create/edit/duplicate/delete, multiple projects, legacy configuration, 2,000 saved actions without a count limit, invalid commands/IDs/paths, missing Git Bash, stdout/stderr/Unicode, relative and absolute working directories, successful/nonzero/missing-command exits, cleared output and reruns, simultaneous action requests, duplicate-run prevention, running-configuration guards, independent service controls, child process termination, and shutdown rejecting late launches. Integration tests use real Git Bash and Windows Job Objects.
+- Added four React rendering tests to `npm test` covering action statuses, frozen completed elapsed time, exit codes/errors, Run/Stop/Edit/Duplicate/Delete availability, Git Bash and pending-operation gating, and the empty state.
+- `npm test`: **20 passed**. `npm run build`: passed TypeScript and production bundling. Vite reports the existing application bundle exceeds its 500 KB advisory threshold.
+- `cargo test --manifest-path src-tauri/Cargo.toml`: **30 passed, 0 failed, 2 ignored**. The ignored tests are existing opt-in live provider-interface checks. A terminal regression test initially failed while deleting a still-locked temporary working directory after ConPTY shutdown; test cleanup now retries Windows sharing violations briefly, while retaining the process-tree assertions.
+- Headless Edge UI smoke checks against the production frontend with mocked Tauri IPC passed: create/edit/duplicate/delete, default working directory, multiple concurrent action controls, Run All exclusion, project isolation, streamed stdout/stderr, clear and resumed polling, Follow, and saved configuration after a page reload. Checked the 1360×900 layout and 900×640 minimum window layout with 81 saved actions, including list scrolling and an unclipped output viewport. This validates frontend behavior; actual process execution is covered separately by the native integration tests.
+- No new dependencies. Existing AI Usage work in the workspace was preserved. No installer or standalone executable was rebuilt for Actions; a packaged desktop smoke test remains outstanding.
+
 Environment: Windows, 2026-11-07. The repository initially contained no files or applicable AGENTS.md instructions.
 
 ## Current result

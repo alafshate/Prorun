@@ -1,7 +1,10 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+#[cfg(test)]
+mod action_tests;
 mod engine;
 mod model;
 mod terminal_handshake;
+mod usage;
 mod windows;
 use engine::Engine;
 use model::*;
@@ -39,6 +42,7 @@ struct TerminalStatus {
 #[serde(rename_all = "camelCase")]
 struct Snapshot {
     services: Vec<engine::Status>,
+    actions: Vec<engine::Status>,
     terminals: Vec<TerminalStatus>,
     bash_path: Option<String>,
 }
@@ -46,6 +50,11 @@ struct Snapshot {
 async fn snapshot(engine: State<'_, Engine>) -> Result<Snapshot, String> {
     let inner = engine.inner.lock().unwrap();
     Ok(Snapshot {
+        actions: inner
+            .actions
+            .values()
+            .map(|r| r.lock().unwrap().status.clone())
+            .collect(),
         services: inner
             .runs
             .values()
@@ -104,6 +113,33 @@ async fn service_logs(
 #[tauri::command]
 async fn clear_logs(engine: State<'_, Engine>, id: String) -> Result<(), String> {
     engine.clear_logs(&id);
+    Ok(())
+}
+#[tauri::command]
+async fn action_execute(
+    engine: State<'_, Engine>,
+    id: String,
+    action: String,
+) -> Result<(), String> {
+    let engine = engine.inner().clone();
+    blocking(move || match action.as_str() {
+        "start" => engine.start_action(&id),
+        "stop" => engine.stop_action(&id),
+        _ => Err("Unknown action operation".into()),
+    })
+    .await
+}
+#[tauri::command]
+async fn action_logs(
+    engine: State<'_, Engine>,
+    id: String,
+    after: u64,
+) -> Result<Vec<engine::Log>, String> {
+    Ok(engine.action_logs(&id, after))
+}
+#[tauri::command]
+async fn clear_action_logs(engine: State<'_, Engine>, id: String) -> Result<(), String> {
+    engine.clear_action_logs(&id);
     Ok(())
 }
 #[tauri::command]
@@ -195,6 +231,44 @@ async fn validate_directory(path: String) -> Result<String, String> {
     blocking(move || directory(path).map(|p| p.to_string_lossy().into())).await
 }
 
+#[tauri::command]
+async fn usage_settings(usage: State<'_, usage::Usage>) -> Result<usage::Settings, String> {
+    let usage = usage.inner().clone();
+    blocking(move || Ok(usage.settings())).await
+}
+#[tauri::command]
+async fn usage_save_settings(
+    usage: State<'_, usage::Usage>,
+    settings: usage::Settings,
+) -> Result<(), String> {
+    let usage = usage.inner().clone();
+    blocking(move || usage.save(settings)).await
+}
+#[tauri::command]
+async fn usage_refresh(
+    usage: State<'_, usage::Usage>,
+    engine: State<'_, Engine>,
+) -> Result<usage::Report, String> {
+    let projects = engine.inner.lock().unwrap().config.projects.clone();
+    let usage = usage.inner().clone();
+    blocking(move || Ok(usage.refresh(&projects))).await
+}
+#[tauri::command]
+async fn usage_capture_info(usage: State<'_, usage::Usage>) -> Result<usage::CaptureInfo, String> {
+    let usage = usage.inner().clone();
+    blocking(move || usage.capture_info()).await
+}
+#[tauri::command]
+async fn usage_capture(
+    usage: State<'_, usage::Usage>,
+    engine: State<'_, Engine>,
+    enable: bool,
+) -> Result<(), String> {
+    let bash_path = engine.inner.lock().unwrap().config.bash_path.clone();
+    let usage = usage.inner().clone();
+    blocking(move || usage.capture(enable, &bash_path)).await
+}
+
 fn main() {
     let app = tauri::Builder::default()
         .plugin(tauri_plugin_single_instance::init(|app, _, _| {
@@ -216,6 +290,7 @@ fn main() {
                 std::io::Error::other(error)
             })?;
             app.manage(engine);
+            app.manage(usage::Usage::new(app.path().app_config_dir()?));
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -226,12 +301,20 @@ fn main() {
             project_action,
             service_logs,
             clear_logs,
+            action_execute,
+            action_logs,
+            clear_action_logs,
             terminal_create,
             terminal_write,
             terminal_resize,
             terminal_read,
             terminal_close,
-            validate_directory
+            validate_directory,
+            usage_settings,
+            usage_save_settings,
+            usage_refresh,
+            usage_capture_info,
+            usage_capture
         ])
         .on_window_event(|window, event| {
             if let tauri::WindowEvent::CloseRequested { .. } = event {

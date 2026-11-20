@@ -41,6 +41,11 @@ impl Job {
 
 pub struct Process { pub handle: Handle, pub job: Job }
 impl Process {
+    pub fn exit_code(&self) -> Option<i32> { unsafe {
+        if WaitForSingleObject(self.handle.0, 0) != WAIT_OBJECT_0 { return None; }
+        let mut code = 1;
+        if GetExitCodeProcess(self.handle.0, &mut code) == 0 { None } else { Some(code as i32) }
+    } }
     pub fn wait(&self) -> i32 { unsafe {
         WaitForSingleObject(self.handle.0, INFINITE);
         let mut code = 1; GetExitCodeProcess(self.handle.0, &mut code); code as i32

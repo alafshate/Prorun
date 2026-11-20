@@ -4,9 +4,11 @@ use std::{collections::HashSet, path::{Path,PathBuf},time::{SystemTime,UNIX_EPOC
 #[derive(Clone,Serialize,Deserialize,PartialEq)]
 #[serde(rename_all="camelCase")]
 pub struct Service { pub id:String, pub name:String, pub directory:String, pub command:String }
+// Actions share command configuration, but have independent storage and runtimes.
+pub type Action = Service;
 #[derive(Clone,Serialize,Deserialize,PartialEq)]
 #[serde(rename_all="camelCase")]
-pub struct Project { pub id:String, pub name:String, pub root:String, pub services:Vec<Service> }
+pub struct Project { pub id:String, pub name:String, pub root:String, pub services:Vec<Service>, #[serde(default)] pub actions:Vec<Action> }
 #[derive(Clone,Serialize,Deserialize)]
 #[serde(rename_all="camelCase")]
 pub struct Config { pub version:u32, pub bash_path:String, pub projects:Vec<Project> }
@@ -32,6 +34,10 @@ impl Config {
             for s in &p.services {
                 if s.id.is_empty() || !ids.insert(&s.id) || s.name.trim().is_empty() || s.command.trim().is_empty() { return Err("Services require unique IDs, a name, and a startup command".into()); }
                 if s.command.contains('\0') || s.command.len()>24000 { return Err("Startup command is invalid or too long (24 KB maximum)".into()); }
+            }
+            for a in &p.actions {
+                if a.id.is_empty() || !ids.insert(&a.id) || a.name.trim().is_empty() || a.command.trim().is_empty() { return Err("Actions require unique IDs, a name, and a command".into()); }
+                if a.command.contains('\0') || a.command.len()>24000 { return Err("Action command is invalid or too long (24 KB maximum)".into()); }
             }
         } Ok(())
     }
@@ -65,9 +71,30 @@ fn valid_bash(p:PathBuf)->Option<PathBuf> {
     use super::*;
     #[test] fn reject_duplicate_service_ids() {
         let mut c=Config::default(); let s=Service{id:"s".into(),name:"Web".into(),directory:".".into(),command:"npm run dev".into()};
-        c.projects.push(Project{id:"p".into(),name:"Demo".into(),root:"C:\\demo".into(),services:vec![s.clone(),s]});
+        c.projects.push(Project{id:"p".into(),name:"Demo".into(),root:"C:\\demo".into(),services:vec![s.clone(),s],actions:vec![]});
         assert!(c.validate().is_err());
     }
     #[test] fn missing_directory_is_actionable() { assert!(directory("Z:\\prorun-nonexistent-path").unwrap_err().contains("Directory does not exist")); }
     #[test] fn detect_real_git_bash() { assert!(find_bash("").is_some()); }
+    #[test] fn legacy_projects_default_to_no_actions() {
+        let config:Config = serde_json::from_str(r#"{"version":1,"bashPath":"","projects":[{"id":"p","name":"Demo","root":"C:\\demo","services":[]}]}"#).unwrap();
+        config.validate().unwrap();
+        assert!(config.projects[0].actions.is_empty());
+    }
+    #[test] fn actions_validate_ids_commands_and_have_no_count_limit() {
+        let mut config:Config = serde_json::from_str(r#"{"version":1,"bashPath":"","projects":[{"id":"p","name":"Demo","root":"C:\\demo","services":[]}]}"#).unwrap();
+        config.projects[0].actions = (0..2000).map(|i| Action { id:format!("a{i}"), name:"Test".into(), directory:".".into(), command:"npm test".into() }).collect();
+        config.validate().unwrap();
+        let original = config.projects[0].actions[0].clone();
+        for command in ["", " \n", "echo \0", &"x".repeat(24001)] {
+            config.projects[0].actions[0].command = command.into();
+            assert!(config.validate().is_err());
+        }
+        config.projects[0].actions[0] = original.clone();
+        config.projects[0].services.push(original);
+        assert!(config.validate().is_err(), "Actions and services cannot share an ID");
+        config.projects[0].services.clear();
+        config.projects[0].actions[0].id = "p".into();
+        assert!(config.validate().is_err(), "Action IDs cannot collide with project IDs");
+    }
 }
