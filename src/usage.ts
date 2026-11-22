@@ -1,4 +1,6 @@
 export interface UsageSettings {
+  tracking: Record<string, boolean>;
+  providers: { id: string; name: string; source: string }[];
   codexExecutable: string;
   codexHome: string;
   claudeHome: string;
@@ -40,6 +42,7 @@ export interface UsageReport {
   sessions: number;
   files: number;
   warnings: string[];
+  sources: Record<string, { sessions: number; files: number; warnings: string[] }>;
 }
 export type Period = 'day' | 'week' | 'month';
 export type Breakdown = 'provider' | 'project' | 'model' | 'token';
@@ -60,7 +63,26 @@ export const money = (value: number) =>
     currency: 'USD',
     maximumFractionDigits: value < 1 ? 4 : 2,
   }).format(value);
-export const providerName = (id: string) => (id === 'codex' ? 'OpenAI Codex' : 'Claude Code');
+export const providerName = (id: string) =>
+  ({ codex: 'OpenAI Codex', claude: 'Claude Code' })[id] || id;
+export const trackingEnabled = (settings: UsageSettings | null, id: string) =>
+  settings !== null && settings.tracking[id] !== false;
+export function visibleUsage(report: UsageReport | null, settings: UsageSettings | null) {
+  if (!report) return null;
+  const sources = Object.fromEntries(
+    Object.entries(report.sources).filter(([id]) => trackingEnabled(settings, id)),
+  );
+  const coverage = Object.values(sources);
+  return {
+    ...report,
+    sources,
+    sessions: coverage.reduce((n, s) => n + s.sessions, 0),
+    files: coverage.reduce((n, s) => n + s.files, 0),
+    warnings: coverage.flatMap((s) => s.warnings),
+    providers: report.providers.filter((p) => trackingEnabled(settings, p.id)),
+    buckets: report.buckets.filter((b) => trackingEnabled(settings, b.provider)),
+  };
+}
 export function limitState(provider: UsageProvider, window: Limit | null, now: number) {
   if (!window || provider.observedAt === null) return 'unavailable';
   if (

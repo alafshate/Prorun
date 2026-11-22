@@ -237,12 +237,26 @@ async fn usage_settings(usage: State<'_, usage::Usage>) -> Result<usage::Setting
     blocking(move || Ok(usage.settings())).await
 }
 #[tauri::command]
+async fn usage_set_tracking(
+    usage: State<'_, usage::Usage>,
+    provider: String,
+    enabled: bool,
+) -> Result<usage::Settings, String> {
+    let usage = usage.inner().clone();
+    blocking(move || usage.set_tracking(&provider, enabled)).await
+}
+#[tauri::command]
 async fn usage_save_settings(
     usage: State<'_, usage::Usage>,
     settings: usage::Settings,
 ) -> Result<(), String> {
     let usage = usage.inner().clone();
     blocking(move || usage.save(settings)).await
+}
+#[tauri::command]
+async fn usage_report(usage: State<'_, usage::Usage>) -> Result<usage::Report, String> {
+    let usage = usage.inner().clone();
+    blocking(move || Ok(usage.report())).await
 }
 #[tauri::command]
 async fn usage_refresh(
@@ -311,8 +325,10 @@ fn main() {
             terminal_close,
             validate_directory,
             usage_settings,
+            usage_set_tracking,
             usage_save_settings,
             usage_refresh,
+            usage_report,
             usage_capture_info,
             usage_capture
         ])

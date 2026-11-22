@@ -484,12 +484,21 @@
 .usage-settings label {
   margin-bottom: 15px;
 }
-.usage-settings .usage-thresholds {
+.usage-thresholds {
   border: 1px solid #333b47;
   border-radius: 8px;
   padding: 14px;
   margin: 15px 0;
 }
+.usage-empty {
+  padding: 70px 24px;
+  text-align: center;
+  color: #8b99ac;
+  border: 1px solid #333b47;
+  border-radius: 8px;
+}
+.usage-empty h2 { color: #e2e7ee; font-size: 18px; }
+.usage-empty p { margin-bottom: 22px; }
 .usage-thresholds label {
   display: inline-flex;
   align-items: center;

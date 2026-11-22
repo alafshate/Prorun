@@ -10,7 +10,10 @@ use std::{
     io::{BufRead, BufReader, Read, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
     process::{Command, Stdio},
-    sync::{mpsc, Arc, Mutex},
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        mpsc, Arc, Mutex,
+    },
     time::{Duration, SystemTime},
 };
 
@@ -21,14 +24,60 @@ const MAX_RECORDS: usize = 500_000;
 #[derive(Clone, Default, Serialize, Deserialize)]
 #[serde(default, rename_all = "camelCase")]
 pub struct Settings {
+    /// Missing entries default to enabled, including newly registered providers.
+    pub tracking: BTreeMap<String, bool>,
+    #[serde(skip_deserializing, skip_serializing_if = "Vec::is_empty")]
+    pub providers: Vec<ProviderInfo>,
     pub codex_executable: String,
     pub codex_home: String,
     pub claude_home: String,
     pub claude_snapshot: String,
     pub alerts: Vec<u8>,
 }
+impl Settings {
+    fn enabled(&self, id: &str) -> bool {
+        self.tracking.get(id).copied().unwrap_or(true)
+    }
+}
 
-#[derive(Clone, Debug, Default, Serialize)]
+#[derive(Clone, Serialize)]
+pub struct ProviderInfo {
+    id: String,
+    name: String,
+    source: String,
+}
+
+struct Integration {
+    id: &'static str,
+    name: &'static str,
+    source: &'static str,
+    roots: fn(&Settings) -> Vec<PathBuf>,
+    limits: fn(&Settings, &AtomicBool) -> Provider,
+}
+// Registration supplies tracking controls and lifecycle handling for every integration.
+const INTEGRATIONS: &[Integration] = &[
+    Integration {
+        id: "codex",
+        name: "OpenAI Codex",
+        source: "Codex app-server",
+        roots: |s| {
+            vec![
+                PathBuf::from(&s.codex_home).join("sessions"),
+                PathBuf::from(&s.codex_home).join("archived_sessions"),
+            ]
+        },
+        limits: read_codex,
+    },
+    Integration {
+        id: "claude",
+        name: "Claude Code",
+        source: "Claude Code status line",
+        roots: |s| vec![PathBuf::from(&s.claude_home).join("projects")],
+        limits: read_claude_limits,
+    },
+];
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Tokens {
     pub input: u64,
@@ -80,13 +129,13 @@ impl Tokens {
     }
 }
 
-#[derive(Clone, Serialize)]
+#[derive(Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Limit {
     pub used_percent: f64,
     pub resets_at: Option<u64>,
 }
-#[derive(Clone, Serialize)]
+#[derive(Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Provider {
     pub id: String,
@@ -110,7 +159,7 @@ impl Provider {
         }
     }
 }
-#[derive(Clone, Serialize)]
+#[derive(Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Bucket {
     pub timestamp: u64,
@@ -128,6 +177,13 @@ pub struct Report {
     pub sessions: usize,
     pub files: usize,
     pub warnings: Vec<String>,
+    pub sources: BTreeMap<String, Coverage>,
+}
+#[derive(Serialize)]
+pub struct Coverage {
+    sessions: usize,
+    files: usize,
+    warnings: Vec<String>,
 }
 
 #[derive(Serialize)]
@@ -262,7 +318,16 @@ impl LogFile {
             });
         }
     }
-    fn read(&mut self, path: &Path, provider: &str, budget: &mut u64) -> Result<bool, String> {
+    fn read(
+        &mut self,
+        path: &Path,
+        provider: &str,
+        budget: &mut u64,
+        cancelled: &AtomicBool,
+    ) -> Result<bool, String> {
+        if cancelled.load(Ordering::Acquire) {
+            return Ok(false);
+        }
         let meta =
             fs::metadata(path).map_err(|_| "Some session files could not be read.".to_string())?;
         let modified = meta.modified().ok();
@@ -289,7 +354,10 @@ impl LogFile {
             .map_err(|_| "A session read was interrupted; it will be retried.".to_string())?;
         self.offset += data.len() as u64;
         *budget -= data.len() as u64;
-        for byte in data {
+        for (index, byte) in data.into_iter().enumerate() {
+            if index % 4096 == 0 && cancelled.load(Ordering::Acquire) {
+                return Ok(false);
+            }
             if byte == b'\n' {
                 if !self.oversized {
                     match serde_json::from_slice(trim_bom(&self.pending)) {
@@ -367,7 +435,18 @@ fn project_name(cwd: &str, projects: &[Project]) -> String {
             }
         })
 }
+#[cfg(test)]
 fn aggregate(files: &HashMap<PathBuf, LogFile>, projects: &[Project]) -> (Vec<Bucket>, usize) {
+    aggregate_cancellable(files, projects, &AtomicBool::new(false))
+}
+fn aggregate_cancellable(
+    files: &HashMap<PathBuf, LogFile>,
+    projects: &[Project],
+    cancelled: &AtomicBool,
+) -> (Vec<Bucket>, usize) {
+    if cancelled.load(Ordering::Acquire) {
+        return (Vec::new(), 0);
+    }
     let mut records: Vec<_> = files.values().flat_map(|f| f.records.iter()).collect();
     records.sort_by(|a, b| (a.at, &a.key).cmp(&(b.at, &b.key)));
     let mut previous: HashMap<String, Tokens> = HashMap::new();
@@ -375,6 +454,9 @@ fn aggregate(files: &HashMap<PathBuf, LogFile>, projects: &[Project]) -> (Vec<Bu
     let mut normalized = Vec::new();
     let mut sessions = HashSet::new();
     for r in records {
+        if cancelled.load(Ordering::Acquire) {
+            return (Vec::new(), 0);
+        }
         if r.provider == "claude" {
             claude
                 .entry(r.key.clone())
@@ -417,6 +499,9 @@ fn aggregate(files: &HashMap<PathBuf, LogFile>, projects: &[Project]) -> (Vec<Bu
     }));
     let mut buckets: BTreeMap<(u64, String, String, String), Tokens> = BTreeMap::new();
     for r in normalized {
+        if cancelled.load(Ordering::Acquire) {
+            return (Vec::new(), 0);
+        }
         if r.tokens.total() == 0 {
             continue;
         }
@@ -537,12 +622,15 @@ fn find_codex(custom: &str) -> Option<PathBuf> {
         .find(|p| p.is_file() && p.extension().is_some_and(|e| e.eq_ignore_ascii_case("exe")))
 }
 
-fn read_codex(settings: &Settings) -> Provider {
+fn read_codex(settings: &Settings, cancelled: &AtomicBool) -> Provider {
     let unavailable = |message: &str| {
         let mut p = Provider::empty("codex", "Codex app-server");
         p.message = message.into();
         p
     };
+    if cancelled.load(Ordering::Acquire) {
+        return unavailable("Tracking stopped.");
+    }
     let Some(exe) = find_codex(&settings.codex_executable) else {
         return unavailable(
             "Codex executable not found. Set its native executable location in usage settings.",
@@ -597,9 +685,7 @@ fn read_codex(settings: &Settings) -> Provider {
         let deadline = std::time::Instant::now() + Duration::from_secs(15);
         let receive = |id: u64| -> Result<Value, ()> {
             loop {
-                let value = rx
-                    .recv_timeout(deadline.saturating_duration_since(std::time::Instant::now()))
-                    .map_err(|_| ())?;
+                let value = receive_usage(&rx, deadline, cancelled).ok_or(())?;
                 if value["id"].as_u64() == Some(id) {
                     return if value["error"].is_object() {
                         Err(())
@@ -672,9 +758,57 @@ fn claude_limits(v: &Value) -> Option<Provider> {
     Some(p)
 }
 
+/// Last good live reading, keyed by Claude home. Claude Code's usage endpoint
+/// answers frequent checks with HTTP 429, after which `get_usage` can report no
+/// windows; a quick manual refresh must not replace a good reading with nothing.
+static CLAUDE_LIVE: Mutex<Option<(String, Provider)>> = Mutex::new(None);
+/// Refreshes inside this interval reuse the last reading instead of spending
+/// the endpoint's request budget.
+const CLAUDE_MIN_INTERVAL_MS: u64 = 60_000;
+
+fn read_claude_limits(s: &Settings, cancelled: &AtomicBool) -> Provider {
+    let last = CLAUDE_LIVE
+        .lock()
+        .unwrap()
+        .clone()
+        .filter(|(home, _)| *home == s.claude_home)
+        .map(|(_, p)| p);
+    if let Some(p) = &last {
+        if now().saturating_sub(p.observed_at.unwrap_or(0)) < CLAUDE_MIN_INTERVAL_MS {
+            return Provider {
+                refreshed_at: now(),
+                ..p.clone()
+            };
+        }
+    }
+    if let Some(p) = read_claude_live(&s.claude_home, cancelled) {
+        *CLAUDE_LIVE.lock().unwrap() = Some((s.claude_home.clone(), p.clone()));
+        return p;
+    }
+    if cancelled.load(Ordering::Acquire) {
+        return Provider::empty("claude", "Claude Code status line");
+    }
+    let snapshot = read_claude(Path::new(&s.claude_snapshot));
+    let snapshot_empty = snapshot.five_hour.is_none() && snapshot.weekly.is_none();
+    match last {
+        // Keep the previous reading with its original observation time, so the
+        // card still expires it honestly if checks keep failing.
+        Some(mut p) if snapshot_empty || snapshot.observed_at < p.observed_at => {
+            p.refreshed_at = now();
+            p.message =
+                "Claude Code could not check usage just now; showing its last reading.".into();
+            p
+        }
+        _ => snapshot,
+    }
+}
+
 /// Asks the installed Claude Code CLI for plan limits through its stream-json
 /// `get_usage` control request. No prompt is sent, so no model call is made.
-fn read_claude_live(claude_home: &str) -> Option<Provider> {
+fn read_claude_live(claude_home: &str, cancelled: &AtomicBool) -> Option<Provider> {
+    if cancelled.load(Ordering::Acquire) {
+        return None;
+    }
     let exe = find_claude()?;
     let mut command = Command::new(exe);
     command
@@ -741,9 +875,7 @@ fn read_claude_live(claude_home: &str) -> Option<Provider> {
         input.flush().ok()?;
         let deadline = std::time::Instant::now() + Duration::from_secs(20);
         loop {
-            let value = rx
-                .recv_timeout(deadline.saturating_duration_since(std::time::Instant::now()))
-                .ok()?;
+            let value = receive_usage(&rx, deadline, cancelled)?;
             let response = &value["response"];
             if value["type"] == "control_response" && response["request_id"] == "prorun-usage" {
                 return (response["subtype"] == "success").then(|| response["response"].clone());
@@ -757,6 +889,26 @@ fn read_claude_live(claude_home: &str) -> Option<Provider> {
     let _ = child.wait();
     let _ = reader.join();
     claude_limits(&result?)
+}
+
+fn receive_usage(
+    rx: &mpsc::Receiver<Value>,
+    deadline: std::time::Instant,
+    cancelled: &AtomicBool,
+) -> Option<Value> {
+    loop {
+        if cancelled.load(Ordering::Acquire) || std::time::Instant::now() >= deadline {
+            return None;
+        }
+        match rx.recv_timeout(
+            Duration::from_millis(25)
+                .min(deadline.saturating_duration_since(std::time::Instant::now())),
+        ) {
+            Ok(value) => return Some(value),
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
+            Err(_) => return None,
+        }
+    }
 }
 
 fn read_claude(path: &Path) -> Provider {
@@ -798,26 +950,59 @@ fn read_claude(path: &Path) -> Provider {
 #[derive(Clone)]
 pub struct Usage {
     inner: Arc<Mutex<UsageInner>>,
+    monitors: Arc<Vec<Monitor>>,
 }
 struct UsageInner {
     directory: PathBuf,
     settings: Settings,
-    files: HashMap<PathBuf, LogFile>,
+}
+struct Monitor {
+    cancelled: Mutex<Arc<AtomicBool>>,
+    files: Mutex<HashMap<PathBuf, LogFile>>,
+    history: Mutex<History>,
+}
+#[derive(Clone, Default, Serialize, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+struct History {
+    provider: Option<Provider>,
+    buckets: Vec<Bucket>,
+    sessions: usize,
+    files: usize,
+    warnings: Vec<String>,
 }
 impl Usage {
     pub fn new(directory: PathBuf) -> Self {
-        let settings = fs::read(directory.join("usage-settings.json"))
+        let settings: Settings = fs::read(directory.join("usage-settings.json"))
             .ok()
             .and_then(|b| serde_json::from_slice(trim_bom(&b)).ok())
             .unwrap_or_else(|| Settings {
                 alerts: vec![80, 90, 100],
                 ..Settings::default()
             });
+        // Update only Prorun's owned script, never provider configuration.
+        let _ = update_capture_tracking(&directory, settings.enabled("claude"));
+        let monitors = INTEGRATIONS
+            .iter()
+            .map(|integration| {
+                let history =
+                    fs::read(directory.join(format!("usage-history-{}.json", integration.id)))
+                        .ok()
+                        .and_then(|b| serde_json::from_slice(&b).ok())
+                        .unwrap_or_default();
+                Monitor {
+                    cancelled: Mutex::new(Arc::new(AtomicBool::new(
+                        !settings.enabled(integration.id),
+                    ))),
+                    files: Mutex::new(HashMap::new()),
+                    history: Mutex::new(history),
+                }
+            })
+            .collect();
         Self {
+            monitors: Arc::new(monitors),
             inner: Arc::new(Mutex::new(UsageInner {
                 directory,
                 settings,
-                files: HashMap::new(),
             })),
         }
     }
@@ -845,6 +1030,9 @@ impl Usage {
     /// backup, and its command still receives the same JSON on stdin via Bash.
     pub fn capture(&self, enable: bool, bash_override: &str) -> Result<(), String> {
         let inner = self.inner.lock().unwrap();
+        if enable && !inner.settings.enabled("claude") {
+            return Err("Enable Claude Code tracking before enabling capture.".into());
+        }
         let backup_path = inner.directory.join("claude-capture-backup.json");
         if !enable {
             let backup: CaptureBackup = serde_json::from_slice(
@@ -934,7 +1122,21 @@ impl Usage {
         }
         Ok(())
     }
+    pub fn set_tracking(&self, id: &str, enabled: bool) -> Result<Settings, String> {
+        if !INTEGRATIONS.iter().any(|i| i.id == id) {
+            return Err("Unknown usage provider.".into());
+        }
+        let mut inner = self.inner.lock().unwrap();
+        let mut settings = inner.settings.clone();
+        settings.tracking.insert(id.into(), enabled);
+        self.save_inner(&mut inner, settings)?;
+        Ok(effective(&inner.settings, &inner.directory))
+    }
     pub fn save(&self, settings: Settings) -> Result<(), String> {
+        self.save_inner(&mut self.inner.lock().unwrap(), settings)
+    }
+    fn save_inner(&self, inner: &mut UsageInner, mut settings: Settings) -> Result<(), String> {
+        settings.providers.clear();
         if settings.alerts.iter().any(|n| ![80, 90, 100].contains(n)) {
             return Err("Alert thresholds must be 80, 90, or 100 percent.".into());
         }
@@ -948,7 +1150,6 @@ impl Usage {
                 return Err("Usage paths must be absolute Windows paths.".into());
             }
         }
-        let mut inner = self.inner.lock().unwrap();
         let before = effective(&inner.settings, &inner.directory);
         let after = effective(&settings, &inner.directory);
         if inner.directory.join("claude-capture-backup.json").exists()
@@ -957,104 +1158,280 @@ impl Usage {
         {
             return Err("Disable Claude capture before changing its home or snapshot path, then enable capture again.".into());
         }
-        write_json(&inner.directory.join("usage-settings.json"), &settings)?;
+        update_capture_tracking(&inner.directory, settings.enabled("claude"))?;
+        if let Err(error) = write_json(&inner.directory.join("usage-settings.json"), &settings) {
+            let _ = update_capture_tracking(&inner.directory, before.enabled("claude"));
+            return Err(error);
+        }
+        for (integration, monitor) in INTEGRATIONS.iter().zip(self.monitors.iter()) {
+            let source_changed = (integration.roots)(&before) != (integration.roots)(&after)
+                || (integration.id == "codex" && before.codex_executable != after.codex_executable)
+                || (integration.id == "claude" && before.claude_snapshot != after.claude_snapshot);
+            if before.enabled(integration.id) != after.enabled(integration.id) || source_changed {
+                let mut cancelled = monitor.cancelled.lock().unwrap();
+                cancelled.store(true, Ordering::Release);
+                *cancelled = Arc::new(AtomicBool::new(!after.enabled(integration.id)));
+                drop(cancelled);
+                // Wait only for this provider's cancelled work to release its CLI,
+                // reader thread, and file handles before acknowledging the setting.
+                monitor.files.lock().unwrap().clear();
+            }
+        }
         inner.settings = settings;
-        inner.files.clear();
         Ok(())
     }
     pub fn refresh(&self, projects: &[Project]) -> Report {
-        let mut inner = self.inner.lock().unwrap();
-        let settings = effective(&inner.settings, &inner.directory);
-        let mut warnings = HashSet::new();
-        let mut paths = Vec::new();
-        for (provider, root) in [
+        let (settings, directory, tokens) = {
+            let inner = self.inner.lock().unwrap();
             (
-                "codex",
-                PathBuf::from(&settings.codex_home).join("sessions"),
-            ),
-            (
-                "codex",
-                PathBuf::from(&settings.codex_home).join("archived_sessions"),
-            ),
-            (
-                "claude",
-                PathBuf::from(&settings.claude_home).join("projects"),
-            ),
-        ] {
-            if !root.exists() {
-                if !root.ends_with("archived_sessions") {
-                    warnings.insert(format!(
-                        "{provider}: local session directory not found; check usage settings."
-                    ));
-                }
+                effective(&inner.settings, &inner.directory),
+                inner.directory.clone(),
+                self.monitors
+                    .iter()
+                    .map(|m| m.cancelled.lock().unwrap().clone())
+                    .collect::<Vec<_>>(),
+            )
+        };
+        for ((integration, monitor), cancelled) in
+            INTEGRATIONS.iter().zip(self.monitors.iter()).zip(tokens)
+        {
+            if cancelled.load(Ordering::Acquire) {
                 continue;
             }
-            discover(&root, provider, 0, &mut paths, &mut warnings);
-        }
-        // Index recent activity first on large installations. Every file keeps
-        // its own cursor, so later refreshes still make progress through backlog.
-        paths.sort_by_cached_key(|(path, _)| {
-            (
-                std::cmp::Reverse(
-                    fs::metadata(path)
-                        .and_then(|m| m.modified())
-                        .unwrap_or(SystemTime::UNIX_EPOCH),
-                ),
-                path.clone(),
-            )
-        });
-        paths.dedup();
-        let accessible: HashSet<_> = paths.iter().map(|(p, _)| p).collect();
-        inner.files.retain(|p, _| accessible.contains(p));
-        let mut budget = SCAN_BYTES;
-        let mut records = inner.files.values().map(|f| f.records.len()).sum::<usize>();
-        for (path, provider) in &paths {
-            if records >= MAX_RECORDS {
-                warnings.insert("History metadata limit reached (500,000 records). Choose a smaller source directory.".into());
-                break;
+            // Concurrent/manual requests do not queue another scan behind an active one.
+            let Ok(mut files) = monitor.files.try_lock() else {
+                continue;
+            };
+            if cancelled.load(Ordering::Acquire) {
+                continue;
             }
-            let f = inner.files.entry(path.clone()).or_default();
-            let before = f.records.len();
-            match f.read(path, provider, &mut budget) {
-                Ok(true) => {
-                    warnings.insert(
-                        "History is still indexing; refresh again to load the next batch.".into(),
-                    );
-                }
-                Err(e) => {
-                    warnings.insert(e);
-                }
-                _ => {}
+            let Some(mut history) =
+                collect(integration, &settings, &mut files, projects, &cancelled)
+            else {
+                continue;
+            };
+            let control = monitor.cancelled.lock().unwrap();
+            if cancelled.load(Ordering::Acquire) {
+                continue;
             }
-            records = records.saturating_sub(before) + f.records.len();
+            if let Err(error) = write_json(
+                &directory.join(format!("usage-history-{}.json", integration.id)),
+                &history,
+            ) {
+                history.warnings.push(format!(
+                    "{}: could not save usage history: {error}",
+                    integration.id
+                ));
+            }
+            *monitor.history.lock().unwrap() = history;
+            drop(control);
         }
-        if inner.files.values().any(|f| f.malformed > 0) {
-            warnings.insert("Incomplete, oversized, or malformed log records were skipped. History may be partial.".into());
-        }
-        if inner.files.values().any(|f| f.regressed) {
-            warnings.insert("Some Codex counters moved backwards. Only increases above observed totals are counted; history may be partial.".into());
-        }
-        if inner.files.values().any(|f| !f.pending.is_empty()) {
-            warnings.insert(
-                "A trailing record is incomplete and will be retried when its writer finishes."
-                    .into(),
+        self.report()
+    }
+    pub fn report(&self) -> Report {
+        let inner = self.inner.lock().unwrap();
+        let mut report = Report {
+            refreshed_at: 0,
+            providers: Vec::new(),
+            buckets: Vec::new(),
+            sessions: 0,
+            files: 0,
+            warnings: Vec::new(),
+            sources: BTreeMap::new(),
+        };
+        for (integration, monitor) in INTEGRATIONS.iter().zip(self.monitors.iter()) {
+            if !inner.settings.enabled(integration.id) {
+                continue;
+            }
+            let history = monitor.history.lock().unwrap();
+            if let Some(provider) = &history.provider {
+                report.refreshed_at = report.refreshed_at.max(provider.refreshed_at);
+                report.providers.push(provider.clone());
+            }
+            report.buckets.extend(history.buckets.iter().cloned());
+            report.sessions += history.sessions;
+            report.files += history.files;
+            report.warnings.extend(history.warnings.iter().cloned());
+            report.sources.insert(
+                integration.id.into(),
+                Coverage {
+                    sessions: history.sessions,
+                    files: history.files,
+                    warnings: history.warnings.clone(),
+                },
             );
         }
-        let (buckets, sessions) = aggregate(&inner.files, projects);
-        Report {
-            refreshed_at: now(),
-            providers: vec![
-                read_codex(&settings),
-                read_claude_live(&settings.claude_home)
-                    .unwrap_or_else(|| read_claude(Path::new(&settings.claude_snapshot))),
-            ],
-            buckets,
-            sessions,
-            files: paths.len(),
-            warnings: warnings.into_iter().collect(),
-        }
+        report
     }
 }
+
+fn collect(
+    integration: &Integration,
+    settings: &Settings,
+    files: &mut HashMap<PathBuf, LogFile>,
+    projects: &[Project],
+    cancelled: &AtomicBool,
+) -> Option<History> {
+    if cancelled.load(Ordering::Acquire) {
+        return None;
+    }
+    let mut warnings = HashSet::new();
+    let mut paths = Vec::new();
+    for root in (integration.roots)(settings) {
+        if cancelled.load(Ordering::Acquire) {
+            return None;
+        }
+        if !root.exists() {
+            if !root.ends_with("archived_sessions") {
+                warnings.insert(format!(
+                    "{}: local session directory not found; check usage settings.",
+                    integration.id
+                ));
+            }
+            continue;
+        }
+        discover(
+            &root,
+            integration.id,
+            0,
+            &mut paths,
+            &mut warnings,
+            cancelled,
+        );
+    }
+    if cancelled.load(Ordering::Acquire) {
+        return None;
+    }
+    paths.sort_by_cached_key(|(path, _)| {
+        (
+            std::cmp::Reverse(if cancelled.load(Ordering::Acquire) {
+                SystemTime::UNIX_EPOCH
+            } else {
+                fs::metadata(path)
+                    .and_then(|m| m.modified())
+                    .unwrap_or(SystemTime::UNIX_EPOCH)
+            }),
+            path.clone(),
+        )
+    });
+    paths.dedup();
+    if cancelled.load(Ordering::Acquire) {
+        return None;
+    }
+    let accessible: HashSet<_> = paths.iter().map(|(p, _)| p).collect();
+    files.retain(|p, _| accessible.contains(p));
+    let mut budget = SCAN_BYTES;
+    let mut records = files.values().map(|f| f.records.len()).sum::<usize>();
+    for (path, provider) in &paths {
+        if cancelled.load(Ordering::Acquire) {
+            return None;
+        }
+        if records >= MAX_RECORDS {
+            warnings.insert("History metadata limit reached (500,000 records). Choose a smaller source directory.".into());
+            break;
+        }
+        let f = files.entry(path.clone()).or_default();
+        let before = f.records.len();
+        match f.read(path, provider, &mut budget, cancelled) {
+            Ok(true) => {
+                warnings.insert(
+                    "History is still indexing; refresh again to load the next batch.".into(),
+                );
+            }
+            Err(e) => {
+                warnings.insert(e);
+            }
+            _ => {}
+        }
+        records = records.saturating_sub(before) + f.records.len();
+    }
+    if cancelled.load(Ordering::Acquire) {
+        return None;
+    }
+    if files.values().any(|f| f.malformed > 0) {
+        warnings.insert(
+            "Incomplete, oversized, or malformed log records were skipped. History may be partial."
+                .into(),
+        );
+    }
+    if files.values().any(|f| f.regressed) {
+        warnings.insert("Some Codex counters moved backwards. Only increases above observed totals are counted; history may be partial.".into());
+    }
+    if files.values().any(|f| !f.pending.is_empty()) {
+        warnings.insert(
+            "A trailing record is incomplete and will be retried when its writer finishes.".into(),
+        );
+    }
+    let (buckets, sessions) = aggregate_cancellable(files, projects, cancelled);
+    if cancelled.load(Ordering::Acquire) {
+        return None;
+    }
+    let provider = (integration.limits)(settings, cancelled);
+    if cancelled.load(Ordering::Acquire) {
+        return None;
+    }
+    Some(History {
+        provider: Some(provider),
+        buckets,
+        sessions,
+        files: paths.len(),
+        warnings: warnings.into_iter().collect(),
+    })
+}
+
+fn update_capture_tracking(directory: &Path, enabled: bool) -> Result<(), String> {
+    let path = directory.join("claude-usage-statusline.ps1");
+    if !directory.join("claude-capture-backup.json").exists() || !path.exists() {
+        return Ok(());
+    }
+    let bytes = fs::read(&path).map_err(|e| e.to_string())?;
+    let mut script = String::from_utf8(trim_bom(&bytes).to_vec())
+        .map_err(|e| e.to_string())?
+        .replace("\r\n", "\n");
+    let marker = "# Prorun tracking control";
+    script = script.replace(
+        "[IO.File]::Replace($temp, $target, $null)",
+        "[IO.File]::Replace($temp, $target, [NullString]::Value)",
+    );
+    if !script.contains(marker) {
+        if !script.starts_with("# Installed only after opt-in.") {
+            return Err(
+                "The Prorun capture script was edited. Restore it before changing tracking.".into(),
+            );
+        }
+        script = format!("$trackingEnabled = $true {marker}\n{script}")
+            .replacen("\ntry {", "\nif ($trackingEnabled) {\ntry {", 1)
+            .replacen("\n$previous =", "\n}\n$previous =", 1)
+            .replace(
+                "} else {\n    $parts =",
+                "} elseif ($trackingEnabled) {\n    $parts =",
+            );
+    }
+    let desired = format!(
+        "$trackingEnabled = ${} {marker}",
+        if enabled { "true" } else { "false" }
+    );
+    script = script
+        .lines()
+        .map(|line| {
+            if line.ends_with(marker) {
+                desired.as_str()
+            } else {
+                line
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+        + "\n";
+    let contents = format!("\u{feff}{script}");
+    if contents.as_bytes() != bytes {
+        let temp = path.with_extension("ps1.tmp");
+        fs::write(&temp, contents).map_err(|e| e.to_string())?;
+        crate::windows::replace(&temp, &path)?;
+    }
+    Ok(())
+}
+
 fn read_settings(path: &Path) -> Result<Value, String> {
     if !path.exists() {
         return Ok(json!({}));
@@ -1069,6 +1446,14 @@ fn read_settings(path: &Path) -> Result<Value, String> {
 }
 fn effective(settings: &Settings, directory: &Path) -> Settings {
     let mut s = settings.clone();
+    s.providers = INTEGRATIONS
+        .iter()
+        .map(|i| ProviderInfo {
+            id: i.id.into(),
+            name: i.name.into(),
+            source: i.source.into(),
+        })
+        .collect();
     let profile = std::env::var_os("USERPROFILE")
         .map(PathBuf::from)
         .unwrap_or_default();
@@ -1091,7 +1476,11 @@ fn discover(
     depth: usize,
     paths: &mut Vec<(PathBuf, &'static str)>,
     warnings: &mut HashSet<String>,
+    cancelled: &AtomicBool,
 ) {
+    if cancelled.load(Ordering::Acquire) {
+        return;
+    }
     if depth > 12 || paths.len() >= 10000 {
         warnings.insert("Session discovery was capped at 10,000 files or 12 nested directories; history is partial.".into());
         return;
@@ -1101,6 +1490,9 @@ fn discover(
         return;
     };
     for entry in entries {
+        if cancelled.load(Ordering::Acquire) {
+            return;
+        }
         let Ok(entry) = entry else {
             continue;
         };
@@ -1120,7 +1512,14 @@ fn discover(
             break;
         }
         if kind.is_dir() {
-            discover(&entry.path(), provider, depth + 1, paths, warnings);
+            discover(
+                &entry.path(),
+                provider,
+                depth + 1,
+                paths,
+                warnings,
+                cancelled,
+            );
         } else if entry.path().extension().is_some_and(|e| e == "jsonl") {
             paths.push((entry.path(), provider));
         }
@@ -1140,6 +1539,219 @@ fn write_json(path: &Path, value: &impl Serialize) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    fn fixture_usage(directory: &Path) -> Usage {
+        let home = directory.join("codex");
+        fs::create_dir_all(home.join("sessions")).unwrap();
+        let source = directory.join("monitor.rs");
+        fs::write(
+            &source,
+            include_str!("../../tests/fixtures/usage-monitor.rs"),
+        )
+        .unwrap();
+        let executable = directory.join("monitor.exe");
+        let output = Command::new("rustc")
+            .arg(&source)
+            .arg("-o")
+            .arg(&executable)
+            .creation_flags(0x08000000)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let usage = Usage::new(directory.to_owned());
+        usage
+            .save(Settings {
+                codex_home: home.to_string_lossy().into(),
+                codex_executable: executable.to_string_lossy().into(),
+                claude_home: directory.join("claude").to_string_lossy().into(),
+                tracking: BTreeMap::from([("claude".into(), false)]),
+                ..Settings::default()
+            })
+            .unwrap();
+        usage
+    }
+    fn write_history(home: &Path, input: u64) {
+        let value = format!(
+            "{}\n{}\n",
+            json!({"type":"session_meta","payload":{"id":"session","cwd":"C:/Demo"}}),
+            json!({"type":"event_msg","timestamp":"2026-11-20T12:00:00Z","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":input}}}})
+        );
+        fs::write(home.join("sessions/session.jsonl"), value).unwrap();
+    }
+    fn capture_output(script: &Path, input: &Value) -> std::process::Output {
+        let mut process = Command::new("powershell.exe")
+            .args([
+                "-NoLogo",
+                "-NoProfile",
+                "-NonInteractive",
+                "-ExecutionPolicy",
+                "Bypass",
+                "-File",
+            ])
+            .arg(script)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .creation_flags(0x08000000)
+            .spawn()
+            .unwrap();
+        process
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(input.to_string().as_bytes())
+            .unwrap();
+        let output = process.wait_with_output().unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        output
+    }
+    #[test]
+    fn tracking_defaults_and_registry_cover_old_settings_and_future_providers() {
+        let settings: Settings = serde_json::from_value(json!({"alerts":[80]})).unwrap();
+        assert!(
+            settings.enabled("codex") && settings.enabled("claude") && settings.enabled("future")
+        );
+        let directory = temp();
+        let usage = Usage::new(directory.clone());
+        assert_eq!(usage.settings().providers.len(), INTEGRATIONS.len());
+        assert!(usage.set_tracking("unregistered", false).is_err());
+        fs::remove_dir_all(directory).unwrap();
+    }
+    #[test]
+    fn tracking_changes_leave_other_enabled_collectors_and_history_intact() {
+        let directory = temp();
+        let usage = Usage::new(directory.clone());
+        let claude = &usage.monitors[1];
+        let control = claude.cancelled.lock().unwrap().clone();
+        claude
+            .files
+            .lock()
+            .unwrap()
+            .insert(directory.join("claude.jsonl"), LogFile::default());
+        claude.history.lock().unwrap().provider = Some(Provider::empty("claude", "saved"));
+        usage.set_tracking("codex", false).unwrap();
+        assert!(!control.load(Ordering::Acquire));
+        assert!(Arc::ptr_eq(&control, &claude.cancelled.lock().unwrap()));
+        assert_eq!(claude.files.lock().unwrap().len(), 1);
+        assert_eq!(usage.report().providers[0].source, "saved");
+        usage.set_tracking("claude", false).unwrap();
+        assert!(control.load(Ordering::Acquire));
+        assert!(claude.files.lock().unwrap().is_empty());
+        usage.set_tracking("codex", true).unwrap();
+        assert!(!usage.settings().enabled("claude"));
+        assert_eq!(
+            claude
+                .history
+                .lock()
+                .unwrap()
+                .provider
+                .as_ref()
+                .unwrap()
+                .source,
+            "saved"
+        );
+        fs::remove_dir_all(directory).unwrap();
+    }
+    #[test]
+    fn tracking_shutdown_persists_history_and_resumes_without_affecting_other_provider() {
+        let directory = temp();
+        let usage = fixture_usage(&directory);
+        let home = directory.join("codex");
+        write_history(&home, 100);
+        assert_eq!(total(&usage.refresh(&[]).buckets).total(), 100);
+        let history_path = directory.join("usage-history-codex.json");
+        let history = fs::read(&history_path).unwrap();
+        let calls = fs::read(home.join("calls")).unwrap();
+        let claude_control = usage.monitors[1].cancelled.lock().unwrap().clone();
+        let old_control = usage.monitors[0].cancelled.lock().unwrap().clone();
+        usage.set_tracking("codex", false).unwrap();
+        assert!(old_control.load(Ordering::Acquire));
+        assert!(Arc::ptr_eq(
+            &claude_control,
+            &usage.monitors[1].cancelled.lock().unwrap()
+        ));
+        write_history(&home, 200);
+        for _ in 0..3 {
+            let report = usage.refresh(&[]);
+            assert!(
+                report.providers.is_empty()
+                    && report.buckets.is_empty()
+                    && report.sources.is_empty()
+            );
+            assert_eq!((report.sessions, report.files), (0, 0));
+        }
+        assert!(usage.monitors[0].files.lock().unwrap().is_empty());
+        assert_eq!(fs::read(&history_path).unwrap(), history);
+        assert_eq!(fs::read(home.join("calls")).unwrap(), calls);
+        let restarted = Usage::new(directory.clone());
+        assert!(!restarted.settings().enabled("codex") && !restarted.settings().enabled("claude"));
+        assert_eq!(
+            total(&restarted.monitors[0].history.lock().unwrap().buckets).total(),
+            100
+        );
+        restarted.set_tracking("codex", true).unwrap();
+        assert_eq!(total(&restarted.report().buckets).total(), 100);
+        let report = restarted.refresh(&[]);
+        assert_eq!(total(&report.buckets).total(), 200);
+        assert_eq!(report.providers.len(), 1);
+        assert_eq!(
+            report.providers[0].five_hour.as_ref().unwrap().used_percent,
+            90.0
+        );
+        assert_eq!(
+            String::from_utf8(fs::read(home.join("calls")).unwrap())
+                .unwrap()
+                .lines()
+                .count(),
+            2
+        );
+        fs::remove_dir_all(directory).unwrap();
+    }
+    #[test]
+    fn disabling_cancels_in_flight_cli_and_waiting_refresh_and_reaps_monitor_process() {
+        let directory = temp();
+        let usage = fixture_usage(&directory);
+        let home = directory.join("codex");
+        fs::write(home.join("block"), "").unwrap();
+        let worker_usage = usage.clone();
+        let worker = std::thread::spawn(move || worker_usage.refresh(&[]));
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while !home.join("pending").exists() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "monitor did not receive request"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let pid: u32 = fs::read_to_string(home.join("pending"))
+            .unwrap()
+            .parse()
+            .unwrap();
+        use windows_sys::Win32::System::Threading::{OpenProcess, WaitForSingleObject};
+        let process = crate::windows::Handle(unsafe { OpenProcess(0x00100000, 0, pid) });
+        assert!(!process.0.is_null());
+        let pending_usage = usage.clone();
+        let pending = std::thread::spawn(move || pending_usage.refresh(&[]));
+        let started = std::time::Instant::now();
+        usage.set_tracking("codex", false).unwrap();
+        assert!(started.elapsed() < Duration::from_secs(3));
+        assert_eq!(
+            unsafe { WaitForSingleObject(process.0, 1000) },
+            0,
+            "monitor process survived disable"
+        );
+        assert!(worker.join().unwrap().providers.is_empty());
+        assert!(pending.join().unwrap().providers.is_empty());
+        assert!(!directory.join("usage-history-codex.json").exists());
+        fs::remove_dir_all(directory).unwrap();
+    }
     fn meta(f: &mut LogFile, id: &str) {
         f.parse(json!({"type":"session_meta","payload":{"id":id,"cwd":"C:\\Work\\Demo","timestamp":"2026-11-20T00:00:00Z"}}),"codex");
     }
@@ -1267,21 +1879,45 @@ mod tests {
         )
         .unwrap();
         let mut f = LogFile::default();
-        f.read(&path, "codex", &mut SCAN_BYTES.clone()).unwrap();
+        f.read(
+            &path,
+            "codex",
+            &mut SCAN_BYTES.clone(),
+            &AtomicBool::new(false),
+        )
+        .unwrap();
         assert_eq!(f.session, "s");
         assert!(!f.pending.is_empty());
         let offset = f.offset;
-        f.read(&path, "codex", &mut SCAN_BYTES.clone()).unwrap();
+        f.read(
+            &path,
+            "codex",
+            &mut SCAN_BYTES.clone(),
+            &AtomicBool::new(false),
+        )
+        .unwrap();
         assert_eq!(f.offset, offset);
         let mut out = fs::OpenOptions::new().append(true).open(&path).unwrap();
         out.write_all(b"\"turn_context\",\"payload\":{\"model\":\"model\"}}\nnot-json\n")
             .unwrap();
         drop(out);
-        f.read(&path, "codex", &mut SCAN_BYTES.clone()).unwrap();
+        f.read(
+            &path,
+            "codex",
+            &mut SCAN_BYTES.clone(),
+            &AtomicBool::new(false),
+        )
+        .unwrap();
         assert_eq!(f.model, "model");
         assert_eq!(f.malformed, 1);
         fs::write(&path, b"{}\n").unwrap();
-        f.read(&path, "codex", &mut SCAN_BYTES.clone()).unwrap();
+        f.read(
+            &path,
+            "codex",
+            &mut SCAN_BYTES.clone(),
+            &AtomicBool::new(false),
+        )
+        .unwrap();
         assert_eq!(f.offset, 3);
         assert!(f.session.is_empty());
         fs::remove_dir_all(directory).unwrap();
@@ -1338,6 +1974,24 @@ mod tests {
                 assert!(usage.capture_info().unwrap().enabled);
                 assert_eq!(read_settings(&path).unwrap()["otherSetting"], true);
                 assert_eq!(read_settings(&path).unwrap()["statusLine"]["padding"], 3);
+                let configured = fs::read(&path).unwrap();
+                let script = directory.join("usage/claude-usage-statusline.ps1");
+                // Simulate the script installed before tracking controls existed.
+                let legacy = fs::read_to_string(&script)
+                    .unwrap()
+                    .replace("$trackingEnabled = $true # Prorun tracking control\n", "")
+                    .replacen("if ($trackingEnabled) {\ntry {", "try {", 1)
+                    .replace("\n}\n$previous =", "\n$previous =")
+                    .replace("} elseif ($trackingEnabled) {", "} else {");
+                fs::write(&script, legacy).unwrap();
+                usage.set_tracking("claude", false).unwrap();
+                let output = capture_output(&script, &json!({"rate_limits":{}}));
+                assert_eq!(
+                    String::from_utf8_lossy(&output.stdout).trim(),
+                    "existing line"
+                );
+                assert!(!Path::new(&usage.settings().claude_snapshot).exists());
+                assert_eq!(fs::read(&path).unwrap(), configured);
                 usage.capture(false, "").unwrap();
                 assert_eq!(read_settings(&path).unwrap(), original);
             }
@@ -1418,6 +2072,30 @@ mod tests {
         assert_eq!(value.as_object().unwrap().len(), 2);
         assert_eq!(value["rate_limits"]["seven_day"]["used_percentage"], 0);
         assert!(value["capturedAt"].as_u64().unwrap() > 0);
+        let config_path = directory.join("Claude home/settings.json");
+        let config = fs::read(&config_path).unwrap();
+        usage.set_tracking("claude", false).unwrap();
+        let script = directory.join("Usage ' test 测试/claude-usage-statusline.ps1");
+        let output = capture_output(
+            &script,
+            &json!({"rate_limits":{"five_hour":{"used_percentage":99}}}),
+        );
+        assert!(output.stdout.is_empty());
+        assert_eq!(
+            fs::read(&usage.settings().claude_snapshot).unwrap(),
+            snapshot
+        );
+        assert_eq!(fs::read(&config_path).unwrap(), config);
+        usage.set_tracking("claude", true).unwrap();
+        let output = capture_output(
+            &script,
+            &json!({"rate_limits":{"five_hour":{"used_percentage":42}}}),
+        );
+        assert!(String::from_utf8_lossy(&output.stdout).contains("42%"));
+        let resumed: Value =
+            serde_json::from_slice(&fs::read(&usage.settings().claude_snapshot).unwrap()).unwrap();
+        assert_eq!(resumed["rate_limits"]["five_hour"]["used_percentage"], 42);
+        assert_eq!(fs::read(&config_path).unwrap(), config);
         usage.capture(false, "").unwrap();
         fs::remove_dir_all(directory).unwrap();
     }
@@ -1429,14 +2107,51 @@ mod tests {
         assert_eq!(five.resets_at, Some(1_795_171_200_104));
         assert_eq!(p.weekly.unwrap().used_percent, 100.0);
         assert!(p.observed_at.is_some());
-        assert!(claude_limits(&json!({"rate_limits_available":false,"rate_limits":null})).is_none());
-        assert!(claude_limits(&json!({"rate_limits_available":true,"rate_limits":{"five_hour":null}})).is_none());
+        assert!(
+            claude_limits(&json!({"rate_limits_available":false,"rate_limits":null})).is_none()
+        );
+        assert!(claude_limits(
+            &json!({"rate_limits_available":true,"rate_limits":{"five_hour":null}})
+        )
+        .is_none());
+    }
+    #[test]
+    fn claude_rapid_or_rate_limited_refresh_keeps_last_reading() {
+        let directory = temp();
+        let s = Settings {
+            claude_home: directory.join("home").to_string_lossy().into(),
+            claude_snapshot: directory.join("missing.json").to_string_lossy().into(),
+            ..Settings::default()
+        };
+        let cancelled = AtomicBool::new(false);
+        let mut p = Provider::empty("claude", "Claude Code CLI");
+        p.five_hour = Some(Limit {
+            used_percent: 2.0,
+            resets_at: None,
+        });
+        p.observed_at = Some(now());
+        *CLAUDE_LIVE.lock().unwrap() = Some((s.claude_home.clone(), p.clone()));
+        // A refresh right after a good reading reuses it without asking again.
+        let throttled = read_claude_limits(&s, &cancelled);
+        assert_eq!(throttled.five_hour.unwrap().used_percent, 2.0);
+        assert!(throttled.message.is_empty());
+        // An older reading survives a failed check (this home has no signed-in CLI).
+        let observed = now() - 10 * 60_000;
+        p.observed_at = Some(observed);
+        *CLAUDE_LIVE.lock().unwrap() = Some((s.claude_home.clone(), p));
+        let kept = read_claude_limits(&s, &cancelled);
+        assert_eq!(kept.five_hour.unwrap().used_percent, 2.0);
+        assert_eq!(kept.observed_at, Some(observed));
+        assert!(kept.message.contains("last reading"));
+        *CLAUDE_LIVE.lock().unwrap() = None;
+        fs::remove_dir_all(directory).unwrap();
     }
     #[test]
     #[ignore = "Explicit live smoke test; queries only the installed Claude Code get_usage control request"]
     fn installed_claude_interface() {
         let usage = Usage::new(temp());
-        let p = read_claude_live(&usage.settings().claude_home).expect("no live Claude usage");
+        let p = read_claude_live(&usage.settings().claude_home, &AtomicBool::new(false))
+            .expect("no live Claude usage");
         println!(
             "Claude Code answered; 5-hour window: {}, weekly window: {}",
             p.five_hour.is_some(),
@@ -1447,7 +2162,7 @@ mod tests {
     #[ignore = "Explicit live smoke test; queries only the installed Codex account/rateLimits/read interface"]
     fn installed_codex_interface() {
         let usage = Usage::new(temp());
-        let p = read_codex(&usage.settings());
+        let p = read_codex(&usage.settings(), &AtomicBool::new(false));
         assert!(p.observed_at.is_some(), "{}", p.message);
         println!(
             "Codex app-server answered; 5-hour window: {}, weekly window: {}",

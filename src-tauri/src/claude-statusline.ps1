@@ -1,8 +1,10 @@
 # Installed only after opt-in. Persist ONLY documented subscription limit fields.
+$trackingEnabled = $true # Prorun tracking control
 [Console]::InputEncoding = New-Object Text.UTF8Encoding $false
 [Console]::OutputEncoding = New-Object Text.UTF8Encoding $false
 $raw = [Console]::In.ReadToEnd()
 $OutputEncoding = New-Object Text.UTF8Encoding $false
+if ($trackingEnabled) {
 try {
     $payload = $raw | ConvertFrom-Json
     $limits = @{}
@@ -17,19 +19,20 @@ try {
     $temp = $target + '.' + [guid]::NewGuid().ToString('N') + '.tmp'
     [IO.Directory]::CreateDirectory([IO.Path]::GetDirectoryName($target)) | Out-Null
     [IO.File]::WriteAllText($temp, ($snapshot | ConvertTo-Json -Depth 5 -Compress), (New-Object Text.UTF8Encoding $false))
-    if ([IO.File]::Exists($target)) { [IO.File]::Replace($temp, $target, $null) }
+    if ([IO.File]::Exists($target)) { [IO.File]::Replace($temp, $target, [NullString]::Value) }
     else {
         try { [IO.File]::Move($temp, $target) }
-        catch { [IO.File]::Replace($temp, $target, $null) }
+        catch { [IO.File]::Replace($temp, $target, [NullString]::Value) }
     }
 } catch { } # Capture failure must not break the user's status line.
 finally {
     if ($temp -and [IO.File]::Exists($temp)) { try { [IO.File]::Delete($temp) } catch { } }
 }
+}
 $previous = '__PREVIOUS__'
 if ($previous) {
     $raw | & '__BASH__' --noprofile --norc -c $previous
-} else {
+} elseif ($trackingEnabled) {
     $parts = @()
     if ($null -ne $payload.rate_limits.five_hour.used_percentage) { $parts += ('5h: ' + $payload.rate_limits.five_hour.used_percentage + '%') }
     if ($null -ne $payload.rate_limits.seven_day.used_percentage) { $parts += ('Weekly: ' + $payload.rate_limits.seven_day.used_percentage + '%') }

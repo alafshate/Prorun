@@ -35,6 +35,8 @@ import Modal from './Modal';
 import LogsPane from './LogsPane';
 import TerminalPane from './TerminalPane';
 import UsageTab from './UsageTab';
+import UsageTrackingControls from './UsageTrackingControls';
+import type { UsageSettings } from './usage';
 import ActionsPane from './ActionsPane';
 
 type Editor =
@@ -48,6 +50,7 @@ const newId = () => crypto.randomUUID();
 export default function App() {
   const [view, setView] = useState<'project' | 'usage'>('project');
   const [usageAlerts, setUsageAlerts] = useState(0);
+  const [usageSettings, setUsageSettings] = useState<UsageSettings | null>(null);
   const [config, setConfig] = useState<Config | null>(null),
     [snapshot, setSnapshot] = useState<Snapshot>(initialSnapshot),
     [selected, setSelected] = useState(''),
@@ -68,6 +71,9 @@ export default function App() {
   configRef.current = config;
   const showError = useCallback((e: unknown) => setError(String(e)), []);
   const refresh = useCallback(async () => setSnapshot(await invoke<Snapshot>('snapshot')), []);
+  useEffect(() => {
+    void invoke<UsageSettings>('usage_settings').then(setUsageSettings).catch(showError);
+  }, [showError]);
   useEffect(() => {
     let disposed = false,
       timer: ReturnType<typeof setTimeout>;
@@ -524,7 +530,12 @@ export default function App() {
             </button>
           </div>
         )}
-        <UsageTab active={view === 'usage'} onAlertCount={setUsageAlerts} />
+        <UsageTab
+          active={view === 'usage'}
+          onAlertCount={setUsageAlerts}
+          settings={usageSettings}
+          onSettingsChange={setUsageSettings}
+        />
         {!project ? (
           <div className="welcome" hidden={view === 'usage'}>
             <div className="welcome-art">
@@ -877,6 +888,7 @@ export default function App() {
             )}
             {editor.kind === 'settings' && (
               <>
+                <UsageTrackingControls settings={usageSettings} onChange={setUsageSettings} />
                 <div className="settings-status">
                   <TerminalIcon size={22} />
                   <div>

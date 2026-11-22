@@ -140,3 +140,31 @@ test('alerts honor enabled thresholds, missing data, and snapshot expiry', () =>
   assert.equal(activeAlerts(report, [80], now + 301_000).length, 0);
   assert.equal(activeAlerts(null, [80], now).length, 0);
 });
+
+test('provider tracking filters all usage, coverage, notes, costs and alerts without losing history', () => {
+  const settings = { tracking: { codex: false }, providers: [{ id: 'codex' }, { id: 'claude' }, { id: 'future' }] };
+  const report = {
+    refreshedAt: now,
+    providers: [provider(), provider({ id: 'claude' }), provider({ id: 'future' })],
+    buckets: [bucket(), bucket({ provider: 'claude', model: 'claude-opus-5-5' }), bucket({ provider: 'future' })],
+    sessions: 12, files: 18, warnings: ['codex note', 'claude note'],
+    sources: {
+      codex: { sessions: 9, files: 12, warnings: ['codex note'] },
+      claude: { sessions: 2, files: 4, warnings: ['claude note'] },
+      future: { sessions: 1, files: 2, warnings: [] },
+    },
+  };
+  const filtered = usage.visibleUsage(report, settings);
+  assert.deepEqual(filtered.providers.map((p) => p.id), ['claude', 'future']);
+  assert.deepEqual(filtered.buckets.map((b) => b.provider), ['claude', 'future']);
+  assert.deepEqual([filtered.sessions, filtered.files, filtered.warnings], [3, 6, ['claude note']]);
+  assert.equal(activeAlerts(filtered, [80], now).length, 2);
+  assert.equal(chartData(filtered.buckets, 'week', 'provider', now).totals.length, 2);
+  assert.equal(estimate(filtered.buckets).unpriced, 400);
+  assert.deepEqual(usage.visibleUsage(report, { ...settings, tracking: {} }), report);
+  const off = usage.visibleUsage(report, { ...settings, tracking: { codex: false, claude: false, future: false } });
+  assert.deepEqual([off.providers, off.buckets, off.warnings, off.sessions, off.files], [[], [], [], 0, 0]);
+  assert.equal(report.buckets.length, 3);
+  assert.equal(usage.trackingEnabled(settings, 'future'), true);
+  assert.equal(usage.trackingEnabled(null, 'codex'), false);
+});

@@ -12,6 +12,7 @@ import {
   X,
 } from 'lucide-react';
 import Modal from './Modal';
+import UsageTrackingControls from './UsageTrackingControls';
 import {
   activeAlerts,
   chartData,
@@ -22,8 +23,9 @@ import {
   money,
   parsePrices,
   prices,
-  providerName,
   totalTokens,
+  trackingEnabled,
+  visibleUsage,
   type Breakdown,
   type Period,
   type UsageProvider,
@@ -40,12 +42,19 @@ const dateTime = (value: number | null) =>
 export default function UsageTab({
   active,
   onAlertCount,
+  settings,
+  onSettingsChange,
 }: {
   active: boolean;
   onAlertCount: (n: number) => void;
+  settings: UsageSettings | null;
+  onSettingsChange: (settings: UsageSettings) => void;
 }) {
-  const [report, setReport] = useState<UsageReport | null>(null);
-  const [settings, setSettings] = useState<UsageSettings | null>(null);
+  const [rawReport, setReport] = useState<UsageReport | null>(null);
+  const report = useMemo(() => visibleUsage(rawReport, settings), [rawReport, settings]);
+  const enabledProviders = (settings?.providers || []).filter((p) => trackingEnabled(settings, p.id));
+  const trackingKey = JSON.stringify(enabledProviders.map((p) => p.id));
+  const hasTracking = enabledProviders.length > 0;
   const [busy, setBusy] = useState(false),
     [error, setError] = useState('');
   const [now, setNow] = useState(Date.now()),
@@ -64,49 +73,76 @@ export default function UsageTab({
   const [priceText, setPriceText] = useState(
     () => localStorage.getItem('prorun-usage-prices') || '{}',
   );
-  const inFlight = useRef(false);
+  const inFlight = useRef<number | null>(null);
+  const queued = useRef(false);
+  const epoch = useRef(0);
+  const refreshLatest = useRef<() => Promise<void>>(async () => {});
   const refresh = useCallback(async () => {
-    if (inFlight.current) return;
-    inFlight.current = true;
+    if (!hasTracking) return;
+    const generation = epoch.current;
+    if (inFlight.current === generation) {
+      queued.current = true;
+      return;
+    }
+    inFlight.current = generation;
     setBusy(true);
     try {
-      setReport(await invoke<UsageReport>('usage_refresh'));
-      setError('');
+      const value = await invoke<UsageReport>('usage_refresh');
+      if (generation === epoch.current) {
+        setReport(value);
+        setError('');
+      }
     } catch (e) {
-      setError(`Usage refresh failed: ${String(e)}`);
+      if (generation === epoch.current) setError(`Usage refresh failed: ${String(e)}`);
     } finally {
-      inFlight.current = false;
-      setBusy(false);
-      setNextRefresh(Date.now() + 120_000);
+      if (inFlight.current === generation) inFlight.current = null;
+      if (generation === epoch.current) {
+        setBusy(false);
+        setNextRefresh(Date.now() + 120_000);
+      }
+      if (generation === epoch.current && queued.current) {
+        queued.current = false;
+        void refreshLatest.current();
+      }
     }
-  }, []);
+  }, [hasTracking]);
+  refreshLatest.current = refresh;
   useEffect(() => {
-    let disposed = false;
-    void invoke<UsageSettings>('usage_settings')
+    epoch.current += 1;
+    queued.current = false;
+    setBusy(false);
+    setNextRefresh(null);
+    setDismissed((old) =>
+      old.filter((id) => enabledProviders.some((p) => id.startsWith(`${p.id}:`))),
+    );
+    setProvider('all');
+    setProject('all');
+    setModel('all');
+    setHover(null);
+    setError('');
+    if (!hasTracking) return;
+    setNow(Date.now());
+    const generation = epoch.current;
+    void invoke<UsageReport>('usage_report')
       .then((value) => {
-        if (!disposed) setSettings(value);
+        if (generation === epoch.current) setReport(value);
       })
-      .catch((e) => {
-        if (!disposed) setError(String(e));
+      .catch(() => {})
+      .finally(() => {
+        if (generation === epoch.current) void refresh();
       });
-    void refresh();
-    const timer = setInterval(() => {
-      void refresh();
-    }, 120_000);
-    const visibility = () => {
-      if (!document.hidden) void refresh();
-    };
+    const timer = setInterval(() => { void refresh(); }, 120_000);
+    const clock = setInterval(() => setNow(Date.now()), 1000);
+    const visibility = () => { if (!document.hidden) void refresh(); };
     document.addEventListener('visibilitychange', visibility);
     return () => {
-      disposed = true;
+      epoch.current += 1;
+      queued.current = false;
       clearInterval(timer);
+      clearInterval(clock);
       document.removeEventListener('visibilitychange', visibility);
     };
-  }, [refresh]);
-  useEffect(() => {
-    const timer = setInterval(() => setNow(Date.now()), 1000);
-    return () => clearInterval(timer);
-  }, []);
+  }, [trackingKey, hasTracking, refresh]);
   const alerts = activeAlerts(report, settings?.alerts || [], now).filter(
     (a) => !dismissed.includes(a.id),
   );
@@ -159,6 +195,8 @@ export default function UsageTab({
       const text = String(data.get('prices') || '{}');
       parsePrices(text);
       const value: UsageSettings = {
+        tracking: settings!.tracking,
+        providers: settings!.providers,
         codexExecutable: String(data.get('codexExecutable') || '').trim(),
         codexHome: String(data.get('codexHome') || '').trim(),
         claudeHome: String(data.get('claudeHome') || '').trim(),
@@ -168,7 +206,7 @@ export default function UsageTab({
       await invoke('usage_save_settings', { settings: value });
       localStorage.setItem('prorun-usage-prices', text);
       setPriceText(text);
-      setSettings(await invoke<UsageSettings>('usage_settings'));
+      onSettingsChange(await invoke<UsageSettings>('usage_settings'));
       setEditing(false);
       void refresh();
     } catch (e) {
@@ -204,12 +242,22 @@ export default function UsageTab({
           <button onClick={() => void openSettings()}>
             <Settings2 size={15} /> Configure
           </button>
-          <button className="primary" disabled={busy} onClick={() => void refresh()}>
+          <button className="primary" disabled={busy || !hasTracking} onClick={() => void refresh()}>
             <RefreshCw size={15} className={busy ? 'spin' : ''} />
             {busy ? 'Refreshing…' : 'Refresh'}
           </button>
         </div>
       </div>
+      {!hasTracking ? (
+        <div className="usage-empty" role="status">
+          <Activity size={28} />
+          <h2>{settings ? 'AI usage tracking is off' : 'Loading AI usage settings...'}</h2>
+          {settings && <>
+            <p>Enable a provider in Settings to resume tracking and view saved usage.</p>
+            <button onClick={() => void openSettings()}><Settings2 size={15} /> Open Settings</button>
+          </>}
+        </div>
+      ) : <>
       <div className="usage-refresh">
         <span>
           <span className="tiny-dot" /> Auto-refresh · every 2 minutes while Prorun is open
@@ -240,9 +288,10 @@ export default function UsageTab({
         </div>
       ))}
       <div className="usage-cards">
-        {['codex', 'claude'].map((id) => (
+        {enabledProviders.map(({ id, source, name }) => (
           <ProviderCard
             key={id}
+            name={name}
             provider={
               report?.providers.find((p) => p.id === id) || {
                 id,
@@ -250,7 +299,7 @@ export default function UsageTab({
                 weekly: null,
                 refreshedAt: 0,
                 observedAt: null,
-                source: id === 'codex' ? 'Codex app-server' : 'Claude Code status line',
+                source,
                 message: busy ? 'Reading local sources…' : 'No source data yet.',
               }
             }
@@ -291,8 +340,7 @@ export default function UsageTab({
               onChange={(e) => setProvider(e.target.value)}
             >
               <option value="all">All providers</option>
-              <option value="codex">OpenAI Codex</option>
-              <option value="claude">Claude Code</option>
+              {enabledProviders.map(({ id, name }) => <option key={id} value={id}>{name}</option>)}
             </select>
           </label>
           <label>
@@ -478,6 +526,7 @@ export default function UsageTab({
           determine subscription percentages.
         </span>
       </footer>
+      </>}
       {editing && settings && (
         <Modal
           title="AI Usage settings"
@@ -486,6 +535,12 @@ export default function UsageTab({
           locked={saving}
         >
           <form className="usage-settings" onSubmit={saveSettings}>
+            <UsageTrackingControls
+              settings={settings}
+              onChange={onSettingsChange}
+              disabled={saving}
+              onPendingChange={setSaving}
+            />
             {settingsError && (
               <div className="form-error" role="alert">
                 {settingsError}
@@ -536,7 +591,9 @@ export default function UsageTab({
               </h3>
               <p>
                 {capture?.enabled
-                  ? 'Capture is enabled. Disable it to restore the original status-line configuration.'
+                  ? trackingEnabled(settings, 'claude')
+                    ? 'Capture is enabled. Disable it to restore the original status-line configuration.'
+                    : 'Capture is paused while Claude Code tracking is off. The existing status-line command is preserved.'
                   : 'Opt in to add a local PowerShell capture script to Claude’s user status line. The current command and its output are preserved through Git Bash, with a backup for restoration. Only rate-limit fields and a timestamp are saved.'}
               </p>
               {capture && (
@@ -551,7 +608,7 @@ export default function UsageTab({
                   </p>
                   <button
                     type="button"
-                    disabled={saving}
+                    disabled={saving || (!capture.enabled && !trackingEnabled(settings, 'claude'))}
                     onClick={() => void changeCapture(!capture.enabled)}
                   >
                     {capture.enabled ? 'Disable capture & restore' : 'Enable capture (opt in)'}
@@ -613,13 +670,13 @@ export default function UsageTab({
   );
 }
 
-function ProviderCard({ provider, now }: { provider: UsageProvider; now: number }) {
+function ProviderCard({ provider, name, now }: { provider: UsageProvider; name: string; now: number }) {
   return (
     <article className={`usage-provider ${provider.id}`}>
       <div className="usage-provider-heading">
         <span className="usage-provider-mark">{provider.id === 'codex' ? '>_' : '✳'}</span>
         <div>
-          <h2>{providerName(provider.id)}</h2>
+          <h2>{name}</h2>
           <span>{provider.source}</span>
         </div>
         <span className="usage-provider-tag">SUBSCRIPTION</span>
@@ -643,7 +700,7 @@ function ProviderCard({ provider, now }: { provider: UsageProvider; now: number 
             <div
               className="usage-meter"
               role="progressbar"
-              aria-label={`${providerName(provider.id)} ${key === 'fiveHour' ? '5-hour' : 'weekly'} usage`}
+              aria-label={`${name} ${key === 'fiveHour' ? '5-hour' : 'weekly'} usage`}
               aria-valuemin={0}
               aria-valuemax={100}
               aria-valuenow={current ? window.usedPercent : undefined}

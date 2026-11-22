@@ -11,7 +11,7 @@
     "package": "tauri build --bundles nsis",
     "package:windows": "node scripts/build-windows.mjs",
     "check": "tsc -b",
-    "test": "node tests/frontend.test.mjs && node tests/build-windows.test.mjs && node tests/usage.test.mjs && node tests/actions.test.mjs"
+    "test": "node tests/frontend.test.mjs && node tests/build-windows.test.mjs && node tests/usage.test.mjs && node tests/usage-ui.test.mjs && node tests/actions.test.mjs"
   },
   "dependencies": {
     "@tauri-apps/api": "^2.10.0",
